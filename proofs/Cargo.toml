@@ -40,10 +40,12 @@ rand_core = { workspace = true, features = ["getrandom"] }
 tracing = { workspace = true }
 blake2b_simd = { workspace = true }
 rand_chacha = { workspace = true }
+itertools = "0.14"
 serde = { workspace = true }
 serde_derive = { workspace = true }
 rayon = { workspace = true }
 criterion = { version = "0.7", optional = true }
+rustc-hash = "2"
 
 # Developer tooling dependencies
 tabbycat = { version = "0.1", features = ["attributes"], optional = true }

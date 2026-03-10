@@ -9,6 +9,7 @@ use blake2b_simd::Params as Blake2bParams;
 use group::ff::FromUniformBytes;
 
 use crate::{
+    plonk::permutation::{expressions, verifier::CommonEvaluated},
     poly::{
         Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, PinnedEvaluationDomain,
         Polynomial,
@@ -27,11 +28,11 @@ mod circuit;
 mod error;
 pub(crate) mod evaluation;
 mod keygen;
-pub(crate) mod lookup;
+pub(crate) mod linearization;
+pub(crate) mod logup;
 pub mod permutation;
 pub(crate) mod traces;
 pub(crate) mod trash;
-pub(crate) mod vanishing;
 
 #[cfg(feature = "bench-internal")]
 pub mod bench;
@@ -462,4 +463,146 @@ impl<F: PrimeField, CS: PolynomialCommitmentScheme<F>> VerifyingKey<F, CS> {
     pub fn get_domain(&self) -> &EvaluationDomain<F> {
         &self.domain
     }
+}
+
+/// Partially evaluates the (batched) identities: all polynomials, except those
+/// corresponding to simple, multiplicative selectors, are evaluated at the
+/// evaluation challenge `x`.
+///
+/// This function is a boilerplate for, both, prover and verifier. The prover
+/// uses it to compute the linearization polynomial, while the verifier needs it
+/// to compute the commitment to the linearization polynomial.
+///
+/// # Returns
+///
+/// The partially evaluated batched identity. It is given as a [Vec] of 2-tuples
+/// `(Option<usize>, F)` containing an evaluation point (representing a
+/// partially or fully evaluated identity at `x`) and an [Option] which
+/// references:
+///     * the fixed column index of a simple, multiplicative selector, if this
+///       evaluation point is multiplied by such a selector,
+///     * `None` otherwise.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn partially_evaluate_identities<'a, F, CS>(
+    vk: &'a VerifyingKey<F, CS>,
+    fixed_evals: &'a [F],
+    instance_evals: &'a [Vec<F>],
+    advice_evals: &'a [Vec<F>],
+    permutation_evals: impl Iterator<Item = &'a Vec<permutation::Evaluated<F>>> + 'a,
+    lookup_evals: impl Iterator<Item = impl Iterator<Item = &'a logup::Evaluated<F>>> + 'a,
+    trashcan_evals: impl Iterator<Item = impl Iterator<Item = &'a trash::Evaluated<F>>> + 'a,
+    permutations_common: &'a CommonEvaluated<F>,
+    x: F,
+    xn: F,
+    beta: F,
+    gamma: F,
+    theta: F,
+    trash_challenge: F,
+    challenges: &'a [F],
+) -> Vec<(Option<usize>, F)>
+where
+    F: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
+    CS: PolynomialCommitmentScheme<F>,
+{
+    let blinding_factors = vk.cs.blinding_factors();
+    let l_evals = vk.domain.l_i_range(x, xn, (-((blinding_factors + 1) as i32))..=0);
+    assert_eq!(l_evals.len(), 2 + blinding_factors);
+    let l_last = l_evals[0];
+    let l_blind: F =
+        l_evals[1..(1 + blinding_factors)].iter().fold(F::ZERO, |acc, eval| acc + eval);
+    let l_0 = l_evals[1 + blinding_factors];
+    let flattened_lookups =
+        vk.cs.lookups.iter().flat_map(|l| l.split(vk.cs().degree())).collect::<Vec<_>>();
+
+    advice_evals
+        .iter()
+        .zip(instance_evals)
+        .zip(permutation_evals)
+        .zip(lookup_evals)
+        .zip(trashcan_evals)
+        .flat_map(
+            |((((advice_evals, instance_evals), permutation), lookups), trash)| {
+                // Evaluate the circuit using the custom gates provided
+                vk.cs
+                    .gates
+                    .iter()
+                    .flat_map(move |gate| {
+                        gate.polynomials().iter().map(move |poly| {
+                            let evaluation = poly.evaluate(
+                                &|scalar| scalar,
+                                &|_| panic!("virtual selectors are removed during optimization"),
+                                &|query| fixed_evals[query.index.unwrap()],
+                                &|query| advice_evals[query.index.unwrap()],
+                                &|query| instance_evals[query.index.unwrap()],
+                                &|challenge| challenges[challenge.index()],
+                                &|a| -a,
+                                &|a, b| a + &b,
+                                &|a, b| a * &b,
+                                &|a, scalar| a * &scalar,
+                            );
+                            (
+                                gate.queried_selectors()
+                                    .iter()
+                                    .filter(|s| s.is_simple())
+                                    .map(|s| s.index())
+                                    .next(),
+                                evaluation,
+                            )
+                        })
+                    })
+                    .chain(
+                        expressions(
+                            permutation,
+                            vk,
+                            &vk.cs.permutation,
+                            permutations_common,
+                            advice_evals,
+                            fixed_evals,
+                            instance_evals,
+                            l_0,
+                            l_last,
+                            l_blind,
+                            beta,
+                            gamma,
+                            x,
+                        )
+                        .map(|e| (None, e)),
+                    )
+                    .chain(
+                        lookups
+                            .zip(flattened_lookups.iter())
+                            .flat_map(move |(p, argument)| {
+                                p.expressions(
+                                    l_0,
+                                    l_last,
+                                    l_blind,
+                                    argument,
+                                    theta,
+                                    beta,
+                                    advice_evals,
+                                    fixed_evals,
+                                    instance_evals,
+                                    challenges,
+                                )
+                            })
+                            .map(|e| (None, e)),
+                    )
+                    .chain(
+                        trash
+                            .zip(vk.cs.trashcans.iter())
+                            .flat_map(move |(p, argument)| {
+                                p.expressions(
+                                    argument,
+                                    trash_challenge,
+                                    advice_evals,
+                                    fixed_evals,
+                                    instance_evals,
+                                    challenges,
+                                )
+                            })
+                            .map(|e| (None, e)),
+                    )
+            },
+        )
+        .collect::<Vec<(Option<usize>, F)>>()
 }

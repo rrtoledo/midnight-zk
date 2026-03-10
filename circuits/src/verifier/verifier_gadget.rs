@@ -18,14 +18,14 @@
 //!
 //! We assume the CS of the verified circuit defines exactly one instance
 //! column. (This is the norm throughout our whole codebase anyway.)
-
-use std::{fmt::Debug, iter};
+use std::{collections::BTreeMap, fmt::Debug, iter};
 
 use ff::Field;
+use group::Group;
 use midnight_proofs::{
-    circuit::{Chip, Layouter, Value},
+    circuit::{AssignedCell, Chip, Layouter, Value},
     plonk::{ConstraintSystem, Error},
-    poly::{EvaluationDomain, Rotation},
+    poly::{CommitmentLabel, EvaluationDomain, Rotation},
 };
 
 use crate::{
@@ -44,7 +44,7 @@ use crate::{
         transcript_gadget::TranscriptGadget,
         trash,
         utils::{evaluate_lagrange_polynomials, inner_product, sum, AssignedBoundedScalar},
-        vanishing, Accumulator, AssignedAccumulator, AssignedVk, SelfEmulation, VerifyingKey,
+        Accumulator, AssignedAccumulator, AssignedMsm, AssignedVk, SelfEmulation, VerifyingKey,
     },
 };
 
@@ -171,6 +171,44 @@ impl<S: SelfEmulation> VerifierGadget<S> {
             &self.scalar_chip,
         )
     }
+
+    /// Witnesses an accumulator with just 1 non-fixed base-scalar pair on each
+    /// side, and as many fixed-base scalars (on its right-hand-side) as
+    /// provided through the `fixed_base_names` argument (no fixed-base scalars
+    /// on the left-hand-side).
+    pub fn assign_collapsed_accumulator(
+        &self,
+        layouter: &mut impl Layouter<S::F>,
+        fixed_base_names: &[String],
+        value: Value<Accumulator<S>>,
+    ) -> Result<AssignedAccumulator<S>, Error> {
+        AssignedAccumulator::assign(
+            layouter,
+            &self.curve_chip,
+            &self.scalar_chip,
+            1,
+            1,
+            &[],
+            fixed_base_names,
+            value,
+        )
+    }
+
+    /// Accumulates several accumulators together. The resulting acc will
+    /// satisfy the invariant iff all the accumulators individually do.
+    pub fn accumulate(
+        &self,
+        layouter: &mut impl Layouter<S::F>,
+        accs: &[AssignedAccumulator<S>],
+    ) -> Result<AssignedAccumulator<S>, Error> {
+        AssignedAccumulator::<S>::accumulate(
+            layouter,
+            self,
+            &self.scalar_chip,
+            &self.sponge_chip,
+            accs,
+        )
+    }
 }
 
 impl<S: SelfEmulation> VerifierGadget<S> {
@@ -187,6 +225,38 @@ impl<S: SelfEmulation> VerifierGadget<S> {
         let transcript_repr: AssignedNative<S::F> =
             self.scalar_chip.assign_as_public_input(layouter, transcript_repr_value)?;
 
+        // We expect a finalized cs with no selectors, i.e. whose selectors have been
+        // converted into fixed columns. In the context of IVC, the constraint system
+        // might still contain selectors.
+        let cs = if cs.num_selectors() > 0 {
+            let selectors = vec![vec![false]; cs.num_selectors()];
+            cs.clone().directly_convert_selectors_to_fixed(selectors).0
+        } else {
+            cs.clone()
+        };
+
+        let assigned_vk = AssignedVk {
+            vk_name: vk_name.to_string(),
+            domain: domain.clone(),
+            cs,
+            transcript_repr,
+        };
+
+        Ok(assigned_vk)
+    }
+
+    /// Assigns a verifying key as a constant. All the necessary information is
+    /// available off-circuit, except for the `transcript_repr` which is
+    /// "assigned fixed".
+    pub fn assign_fixed_vk(
+        &self,
+        layouter: &mut impl Layouter<S::F>,
+        vk_name: &str,
+        domain: &EvaluationDomain<S::F>,
+        cs: &ConstraintSystem<S::F>,
+        transcript_repr_constant: S::F,
+    ) -> Result<AssignedVk<S>, Error> {
+        let transcript_repr = self.scalar_chip.assign_fixed(layouter, transcript_repr_constant)?;
         // We expect a finalized cs with no selectors, i.e. whose selectors have been
         // converted into fixed columns.
         let selectors = vec![vec![false]; cs.num_selectors()];
@@ -220,7 +290,7 @@ impl<S: SelfEmulation> VerifierGadget<S> {
         &self,
         layouter: &mut impl Layouter<S::F>,
         assigned_vk: &AssignedVk<S>,
-        assigned_committed_instances: &[(&str, S::AssignedPoint)], // (name, com)
+        assigned_committed_instances: &[S::AssignedPoint],
         assigned_instances: &[&[AssignedNative<S::F>]],
         proof: Value<Vec<u8>>,
     ) -> Result<(super::traces::VerifierTrace<S>, TranscriptGadget<S>), Error> {
@@ -242,7 +312,7 @@ impl<S: SelfEmulation> VerifierGadget<S> {
 
         assigned_committed_instances
             .iter()
-            .try_for_each(|(_, com)| transcript.common_point(layouter, com))?;
+            .try_for_each(|com| transcript.common_point(layouter, com))?;
 
         for instance in assigned_instances {
             let n = self.scalar_chip.assign_fixed(layouter, (instance.len() as u64).into())?;
@@ -263,10 +333,11 @@ impl<S: SelfEmulation> VerifierGadget<S> {
         // Sample theta challenge for keeping lookup columns linearly independent
         let theta = transcript.squeeze_challenge(layouter)?;
 
-        let lookups_permuted = cs
+        let multiplicities_committed = cs
             .lookups()
             .iter()
-            .map(|_| lookup::read_permuted_commitments(layouter, &mut transcript))
+            .flat_map(|l| l.split(assigned_vk.cs.degree()))
+            .map(|_| lookup::read_multiplicities(layouter, &mut transcript))
             .collect::<Result<Vec<_>, Error>>()?;
 
         let beta = transcript.squeeze_challenge(layouter)?;
@@ -276,11 +347,11 @@ impl<S: SelfEmulation> VerifierGadget<S> {
             // Hash each permutation product commitment
             permutation::read_product_commitments(layouter, &mut transcript, cs)?;
 
-        let lookups_committed = lookups_permuted
+        let lookups_committed = multiplicities_committed
             .into_iter()
             .map(|lookup|
                 // Hash each lookup product commitment
-                lookup.read_product_commitment(layouter, &mut transcript))
+                lookup.read_commitment(layouter, &mut transcript))
             .collect::<Result<Vec<_>, _>>()?;
 
         let trash_challenge = transcript.squeeze_challenge(layouter)?;
@@ -291,15 +362,12 @@ impl<S: SelfEmulation> VerifierGadget<S> {
             .map(|_| trash::read_committed(layouter, &mut transcript))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let vanishing = vanishing::read_commitments_before_y(layouter, &mut transcript)?;
-
         // Sample y challenge, which keeps the gates linearly independent
         let y = transcript.squeeze_challenge(layouter)?;
 
         Ok((
             super::traces::VerifierTrace {
                 advice_commitments,
-                vanishing,
                 lookups: lookups_committed,
                 trashcans: trashcans_committed,
                 permutations: permutation_committed,
@@ -311,6 +379,101 @@ impl<S: SelfEmulation> VerifierGadget<S> {
             },
             transcript,
         ))
+    }
+
+    /// Construct the commitment to the linearization polynomial in-circuit
+    /// (which will be checked in-circuit that it opens to `0` at `x` in the
+    /// multi-open argument):
+    ///
+    ///  `S_0 * id_0(x) + y * S_1 * id_1(x) + ... + y^m * S_m * id_m(x)
+    ///        - (h_0 + x^{n-1} * h_1 + ... + x^{l*(n-1)} * h_l) * (x^n-1),`
+    ///
+    /// where:
+    /// * `y` is the batching challenge,
+    /// * `x` is the evaluation challenge,
+    /// * `id_j(x)` is a (partially or fully) evaluated identity at `x`,
+    /// * `S_j` is, either,
+    ///      - (i)  the commitment to a fixed column corresponding to a simple,
+    ///        multiplicative selector, or,
+    ///      - (ii) the commitment to the constant polynomial `P(X) = 1` (in
+    ///        case the corresponding identity `id_j` has been fully evaluated
+    ///        and, thus, the resulting scalar `id_j(x)` is part of the constant
+    ///        term of the linearization poly),
+    /// * `h_k` are commitments to the limbs of the quotient polynomial.
+    ///
+    /// # Arguments
+    ///
+    /// * `expressions` - the partially evaluated batched identity (computed
+    ///   in-circuit); it is the in-circuit analogue of the output of
+    ///   [midnight_proofs::plonk::partially_evaluate_identities]
+    /// * `splitting_factor` - the splitting factor `x^{n-1}` from decomposing
+    ///   the quotient polynomial `h(T)` into limbs (computed in-circuit)
+    ///
+    /// # Returns
+    ///
+    /// The commitment to the linearization polynomial as [AssignedMsm].
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
+    fn compute_linearization_commitment<'com>(
+        layouter: &mut impl Layouter<S::F>,
+        scalar_chip: &S::ScalarChip,
+        vk: &'com AssignedVk<S>,
+        expressions: Vec<(Option<usize>, AssignedCell<S::F, S::F>)>,
+        y: AssignedCell<S::F, S::F>,
+        xn: AssignedCell<S::F, S::F>,
+        splitting_factor: AssignedCell<S::F, S::F>,
+        quotient_limb_commitments: &'com [S::AssignedPoint],
+        generator: &'com S::AssignedPoint,
+    ) -> Result<AssignedMsm<S>, Error> {
+        let mut acc_msm: AssignedMsm<S> = AssignedMsm::empty();
+
+        let mut splitting_powers = Vec::with_capacity(quotient_limb_commitments.len());
+        // x^n - 1
+        let vanishing_eval = scalar_chip.add_constant(layouter, &xn, -S::F::ONE)?;
+        // 1 - x^n
+        let mut splitting_pow = scalar_chip.neg(layouter, &vanishing_eval)?;
+        for _ in 0..quotient_limb_commitments.len() {
+            splitting_powers.push(splitting_pow.clone());
+            splitting_pow = scalar_chip.mul(layouter, &splitting_pow, &splitting_factor, None)?;
+        }
+        for (idx, limb) in quotient_limb_commitments.iter().enumerate() {
+            acc_msm.add_term(
+                &AssignedBoundedScalar::new(&splitting_powers[idx], None),
+                limb,
+            );
+        }
+
+        let mut grouped_points: BTreeMap<Option<usize>, AssignedCell<S::F, S::F>> = BTreeMap::new();
+        let mut y_pow = scalar_chip.assign_fixed(layouter, S::F::ONE)?;
+        let zero: AssignedCell<S::F, S::F> = scalar_chip.assign_fixed(layouter, S::F::ZERO)?;
+        for (col_idx, eval) in expressions.iter().rev() {
+            let new_eval = scalar_chip.mul(layouter, &y_pow, eval, None)?;
+            *grouped_points.entry(*col_idx).or_insert(zero.clone()) = scalar_chip.add(
+                layouter,
+                grouped_points.entry(*col_idx).or_insert(zero.clone()),
+                &new_eval,
+            )?;
+            y_pow = scalar_chip.mul(layouter, &y_pow, &y, None)?;
+        }
+
+        for (col_idx, eval) in grouped_points {
+            match col_idx.map(|column_index| vk.fixed_commitment_name(column_index)) {
+                Some(com) => {
+                    acc_msm.add_msm(
+                        layouter,
+                        scalar_chip,
+                        &AssignedMsm::from_fixed_term(
+                            &AssignedBoundedScalar::new(&eval, None),
+                            &com,
+                        ),
+                    )?;
+                }
+                // Fully evaluated identities go to the constant term
+                None => acc_msm.add_term(&AssignedBoundedScalar::new(&eval, None), generator),
+            }
+        }
+
+        Ok(acc_msm)
     }
 
     /// Given a [super::traces::VerifierTrace], this function computes the
@@ -326,7 +489,7 @@ impl<S: SelfEmulation> VerifierGadget<S> {
         layouter: &mut impl Layouter<S::F>,
         assigned_vk: &AssignedVk<S>,
         trace: super::traces::VerifierTrace<S>,
-        assigned_committed_instances: &[(&str, S::AssignedPoint)], // (name, com)
+        assigned_committed_instances: &[S::AssignedPoint],
         assigned_instances: &[&[AssignedNative<S::F>]],
         mut transcript: TranscriptGadget<S>,
     ) -> Result<AssignedAccumulator<S>, Error> {
@@ -336,7 +499,6 @@ impl<S: SelfEmulation> VerifierGadget<S> {
 
         let super::traces::VerifierTrace {
             advice_commitments,
-            vanishing,
             lookups,
             trashcans,
             permutations,
@@ -347,11 +509,11 @@ impl<S: SelfEmulation> VerifierGadget<S> {
             y,
         } = trace;
 
-        let vanishing = vanishing.read_commitment_after_y(
-            layouter,
-            &mut transcript,
-            assigned_vk.domain.get_quotient_poly_degree(),
-        )?;
+        // Read commitments to limbs of the quotient polynomial h(X) = nu(X)/(X^n-1)
+        // from the transcript
+        let limb_commitments = (0..assigned_vk.domain.get_quotient_poly_degree())
+            .map(|_| transcript.read_point(layouter))
+            .collect::<Result<Vec<_>, Error>>()?;
 
         // Sample x challenge, which is used to ensure the circuit is satisfied with
         // high probability
@@ -397,11 +559,21 @@ impl<S: SelfEmulation> VerifierGadget<S> {
             .map(|_| transcript.read_scalar(layouter))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let fixed_evals = (0..cs.fixed_queries().len())
+        // The transcript doesn't contain evals of fixed cols corresponding to simple
+        // selectors. Fill up the "missing" places with 1, to align with the
+        // fixed queries
+        let one: AssignedCell<<S as SelfEmulation>::F, <S as SelfEmulation>::F> =
+            self.scalar_chip.assign_fixed(layouter, S::F::ONE)?;
+
+        let num_evaluated_fix_queries = cs.num_fixed_columns() - cs.num_simple_selectors();
+        let mut fixed_evals = (0..num_evaluated_fix_queries)
             .map(|_| transcript.read_scalar(layouter))
             .collect::<Result<Vec<_>, _>>()?;
-
-        let vanishing = vanishing.evaluate_after_x(layouter, &mut transcript)?;
+        for (idx, (col, _)) in assigned_vk.cs.fixed_queries().iter().enumerate() {
+            if assigned_vk.cs.has_simple_selector_col(col.index()) {
+                fixed_evals.insert(idx, one.clone())
+            }
+        }
 
         let permutations_common =
             evaluate_permutation_common(layouter, &mut transcript, cs.permutation().columns.len())?;
@@ -418,124 +590,136 @@ impl<S: SelfEmulation> VerifierGadget<S> {
             .map(|trash| trash.evaluate(layouter, &mut transcript))
             .collect::<Result<Vec<_>, Error>>()?;
 
-        // This check ensures the circuit is satisfied so long as the polynomial
-        // commitments open to the correct values.
-        let vanishing = {
-            let blinding_factors = cs.blinding_factors();
+        // Partially evaluate batched identities
+        // (without fixed columns corresponding to simple selectors)
+        let nr_blinding_factors = cs.blinding_factors();
+        let l_evals = evaluate_lagrange_polynomials(
+            layouter,
+            &self.scalar_chip,
+            1 << k,
+            assigned_vk.domain.get_omega(),
+            (-((nr_blinding_factors + 1) as i32))..1,
+            &x,
+        )?;
+        assert_eq!(l_evals.len(), 2 + nr_blinding_factors);
+        let l_last = l_evals[0].clone();
+        let l_blind = sum::<S::F>(
+            layouter,
+            &self.scalar_chip,
+            &l_evals[1..=nr_blinding_factors],
+        )?;
+        let l_0 = l_evals[1 + nr_blinding_factors].clone();
 
-            let l_evals = evaluate_lagrange_polynomials(
-                layouter,
-                &self.scalar_chip,
-                1 << k,
-                assigned_vk.domain.get_omega(),
-                (-((blinding_factors + 1) as i32))..1,
-                &x,
-            )?;
-            assert_eq!(l_evals.len(), 2 + blinding_factors);
-            let l_last = l_evals[0].clone();
-            let l_blind = sum::<S::F>(layouter, &self.scalar_chip, &l_evals[1..=blinding_factors])?;
-            let l_0 = l_evals[1 + blinding_factors].clone();
+        let mut expressions = Vec::new();
+        let flattened_lookups =
+            cs.lookups().iter().flat_map(|l| l.split(cs.degree())).collect::<Vec<_>>();
 
-            // Compute the expected value of h(x)
-            let expressions = {
-                let evaluated_gate_ids = {
-                    let mut ids = vec![];
-                    for gate in cs.gates().iter() {
-                        for poly in gate.polynomials().iter() {
-                            ids.push(eval_expression::<S>(
-                                layouter,
-                                &self.scalar_chip,
-                                &advice_evals,
-                                &fixed_evals,
-                                &instance_evals,
-                                poly,
-                            )?)
-                        }
-                    }
-                    ids
-                };
-                let evaluated_perm_ids = permutation_expressions(
+        // (Partially) evaluate polys from (custom) gates
+        for gate in cs.gates().iter() {
+            for poly in gate.polynomials().iter() {
+                let eval = eval_expression::<S>(
                     layouter,
                     &self.scalar_chip,
-                    cs,
-                    &permutations_evaluated,
-                    &permutations_common,
+                    &advice_evals,
+                    &fixed_evals,
+                    &instance_evals,
+                    poly,
+                )?;
+                expressions.push((
+                    gate.queried_selectors()
+                        .iter()
+                        .filter(|s| s.is_simple())
+                        .map(|s| s.index())
+                        .next(),
+                    eval,
+                ));
+            }
+        }
+
+        // Evaluate polys from permutation argument
+        permutation_expressions(
+            layouter,
+            &self.scalar_chip,
+            cs,
+            &permutations_evaluated,
+            &permutations_common,
+            &advice_evals,
+            &fixed_evals,
+            &instance_evals,
+            &l_0,
+            &l_last,
+            &l_blind,
+            &beta,
+            &gamma,
+            &x,
+        )?
+        .into_iter()
+        .for_each(|perm_id| expressions.push((None, perm_id)));
+
+        // Evaluate polys from lookup argument
+        lookups_evaluated
+            .iter()
+            .zip(flattened_lookups.iter())
+            .map(|(p, argument)| {
+                lookup_expressions(
+                    layouter,
+                    &self.scalar_chip,
+                    &p.evaluated,
+                    argument.selector_expression(),
+                    argument.input_expressions(),
+                    argument.table_expressions(),
                     &advice_evals,
                     &fixed_evals,
                     &instance_evals,
                     &l_0,
                     &l_last,
                     &l_blind,
+                    &theta,
                     &beta,
-                    &gamma,
-                    &x,
-                )?;
+                )
+            })
+            .collect::<Result<Vec<Vec<_>>, Error>>()?
+            .concat()
+            .into_iter()
+            .for_each(|lookup_id| expressions.push((None, lookup_id)));
 
-                let evaluated_lookup_ids = cs
-                    .lookups()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| {
-                        lookup_expressions(
-                            layouter,
-                            &self.scalar_chip,
-                            &lookups_evaluated[index],
-                            cs.lookups()[index].input_expressions(),
-                            cs.lookups()[index].table_expressions(),
-                            &advice_evals,
-                            &fixed_evals,
-                            &instance_evals,
-                            &l_0,
-                            &l_last,
-                            &l_blind,
-                            &theta,
-                            &beta,
-                            &gamma,
-                        )
-                    })
-                    .collect::<Result<Vec<Vec<_>>, Error>>()?
-                    .concat();
+        // Evaluate polys from trashcan argument
+        cs.trashcans()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                trash_expressions(
+                    layouter,
+                    &self.scalar_chip,
+                    &trashcans_evaluated[index].evaluated,
+                    cs.trashcans()[index].selector(),
+                    cs.trashcans()[index].constraint_expressions(),
+                    &advice_evals,
+                    &fixed_evals,
+                    &instance_evals,
+                    &trash_challenge,
+                )
+            })
+            .collect::<Result<Vec<Vec<_>>, Error>>()?
+            .concat()
+            .into_iter()
+            .for_each(|trash_id| expressions.push((None, trash_id)));
 
-                let evaluated_trashcan_ids = cs
-                    .trashcans()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| {
-                        trash_expressions(
-                            layouter,
-                            &self.scalar_chip,
-                            &trashcans_evaluated[index],
-                            cs.trashcans()[index].selector(),
-                            cs.trashcans()[index].constraint_expressions(),
-                            &advice_evals,
-                            &fixed_evals,
-                            &instance_evals,
-                            &trash_challenge,
-                        )
-                    })
-                    .collect::<Result<Vec<Vec<_>>, Error>>()?
-                    .concat();
-
-                std::iter::empty()
-                    // Evaluate the circuit using the custom gates provided
-                    .chain(evaluated_gate_ids)
-                    .chain(evaluated_perm_ids)
-                    .chain(evaluated_lookup_ids)
-                    .chain(evaluated_trashcan_ids)
-                    .collect::<Vec<_>>()
-            };
-            let splitting_factor =
-                ArithInstructions::pow(&self.scalar_chip, layouter, &x, (1 << k) - 1)?;
-            let xn = self.scalar_chip.mul(layouter, &x, &splitting_factor, None)?;
-            vanishing.verify(
-                layouter,
-                &self.scalar_chip,
-                &expressions,
-                &y,
-                &xn,
-                &splitting_factor,
-            )
-        }?;
+        let splitting_factor =
+            ArithInstructions::pow(&self.scalar_chip, layouter, &x, (1 << k) - 1)?;
+        let xn = self.scalar_chip.mul(layouter, &x, &splitting_factor, None)?;
+        let assigned_gen = self.curve_chip.assign_fixed(layouter, S::C::generator())?;
+        let linearization_com = Self::compute_linearization_commitment(
+            layouter,
+            &self.scalar_chip,
+            assigned_vk,
+            expressions,
+            y,
+            xn,
+            splitting_factor,
+            &limb_commitments,
+            &assigned_gen,
+        )?;
 
         let one = AssignedBoundedScalar::<S::F>::one(layouter, &self.scalar_chip)?;
         let omega = assigned_vk.domain.get_omega();
@@ -559,10 +743,11 @@ impl<S: SelfEmulation> VerifierGadget<S> {
             .chain(cs.instance_queries().iter().enumerate().filter_map(
                 |(query_index, &(column, rot))| {
                     if column.index() < nb_committed_instances {
-                        Some(VerifierQuery::<S>::new_fixed(
+                        Some(VerifierQuery::<S>::new(
                             &one,
                             get_point(&rot),
-                            assigned_committed_instances[column.index()].0,
+                            CommitmentLabel::Instance(column.index()),
+                            &assigned_committed_instances[column.index()],
                             &instance_evals[query_index],
                         ))
                     } else {
@@ -575,26 +760,29 @@ impl<S: SelfEmulation> VerifierGadget<S> {
                     VerifierQuery::<S>::new(
                         &one,
                         get_point(&rot),
+                        CommitmentLabel::Advice(column.index()),
                         &advice_commitments[column.index()],
                         &advice_evals[query_index],
                     )
                 }),
             )
             .chain((permutations_evaluated).queries(&one, &x, &x_next, &x_last))
-            .chain(
-                (lookups_evaluated.iter())
-                    .flat_map(|lookup| lookup.queries(&one, &x, &x_next, &x_prev)),
-            )
+            .chain((lookups_evaluated.iter()).flat_map(|lookup| lookup.queries(&one, &x, &x_next)))
             .chain(trashcans_evaluated.iter().flat_map(|trash| trash.queries(&one, &x)))
             .chain(
-                cs.fixed_queries().iter().enumerate().map(|(query_index, &(col, rot))| {
-                    VerifierQuery::new_fixed(
-                        &one,
-                        get_point(&rot),
-                        &assigned_vk.fixed_commitment_name(col.index()),
-                        &fixed_evals[query_index],
-                    )
-                }),
+                cs.fixed_queries()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (col, _))| !assigned_vk.cs.has_simple_selector_col(col.index()))
+                    .map(|(query_index, &(col, rot))| {
+                        VerifierQuery::new_fixed(
+                            &one,
+                            get_point(&rot),
+                            CommitmentLabel::Fixed(col.index()),
+                            &assigned_vk.fixed_commitment_name(col.index()),
+                            &fixed_evals[query_index],
+                        )
+                    }),
             )
             .chain(
                 permutations_common.queries(
@@ -605,7 +793,12 @@ impl<S: SelfEmulation> VerifierGadget<S> {
                     &x,
                 ),
             )
-            .chain(vanishing.queries(&one, &x));
+            .chain(iter::once(VerifierQuery::new_from_msm(
+                &x,
+                CommitmentLabel::Custom("linearization_poly".into()),
+                &linearization_com,
+                &self.scalar_chip.assign_fixed(layouter, S::F::ZERO)?,
+            )));
 
         // We are now convinced the circuit is satisfied so long as the
         // polynomial commitments open to the correct values, which is true as long
@@ -634,7 +827,7 @@ impl<S: SelfEmulation> VerifierGadget<S> {
         &self,
         layouter: &mut impl Layouter<S::F>,
         assigned_vk: &AssignedVk<S>,
-        assigned_committed_instances: &[(&str, S::AssignedPoint)], // (name, com)
+        assigned_committed_instances: &[S::AssignedPoint],
         assigned_instances: &[&[AssignedNative<S::F>]],
         proof: Value<Vec<u8>>,
     ) -> Result<AssignedAccumulator<S>, Error> {
@@ -659,8 +852,6 @@ impl<S: SelfEmulation> VerifierGadget<S> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-
-    use std::collections::BTreeMap;
 
     use group::Group;
     use midnight_proofs::{
@@ -861,7 +1052,7 @@ pub(crate) mod tests {
             let mut inner_proof_acc = verifier_chip.prepare(
                 &mut layouter,
                 &assigned_inner_vk,
-                &[("com_instance", assigned_committed_instance)],
+                &[assigned_committed_instance],
                 &[&assigned_inner_pi],
                 self.inner_proof.clone(),
             )?;
@@ -919,15 +1110,14 @@ pub(crate) mod tests {
             .expect("Problem preparing the inner proof")
         };
 
-        let mut fixed_bases = BTreeMap::new();
-        fixed_bases.insert(String::from("com_instance"), C::identity());
-        fixed_bases.extend(crate::verifier::fixed_bases::<S>("inner_vk", &inner_vk));
+        let fixed_bases = crate::verifier::fixed_bases::<S>("inner_vk", &inner_vk);
 
-        let mut inner_acc: Accumulator<S> = inner_dual_msm.clone().into();
-        inner_acc.extract_fixed_bases(&fixed_bases);
+        let mut inner_acc =
+            Accumulator::<S>::from_dual_msm(inner_dual_msm.clone(), "inner_vk", &fixed_bases);
 
-        assert!(inner_dual_msm.check(&inner_params.verifier_params()));
-        assert!(inner_acc.check(&inner_params.s_g2().into(), &fixed_bases));
+        let inner_verifier_params = inner_params.verifier_params();
+        assert!(inner_dual_msm.check(&inner_verifier_params));
+        assert!(inner_acc.check(&inner_verifier_params, &fixed_bases));
 
         inner_acc.collapse();
 

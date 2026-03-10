@@ -13,9 +13,20 @@ verification keys break backwards compatibility.
 ## [Unreleased]
 ### Added
 * Add Curve25519 [#181](https://github.com/midnightntwrk/midnight-zk/pull/181)
+* Expose helper functions directly in `verifier_gadget` [#227](https://github.com/midnightntwrk/midnight-zk/pull/227)
 * `CircuitField` refactor: remove helpers, add `ScalarField` in `CircuitCurve` [#201](https://github.com/midnightntwrk/midnight-zk/pull/201)
+* Add method to assign a verifying key as a constant [#202](https://github.com/midnightntwrk/midnight-zk/pull/202)
+* RIPEMD160 chip [#156](https://github.com/midnightntwrk/midnight-zk/pull/156)
+* `CircuitField` refactor: remove helpers, add `ScalarExt` in `CircuitCurve` [#201](https://github.com/midnightntwrk/midnight-zk/pull/201)
+* Support non-fixed input commitments in verifier gadget [#212](https://github.com/midnightntwrk/midnight-zk/pull/212)
 
 ### Changed
+* Add BN poseidon constants [#222](https://github.com/midnightntwrk/midnight-zk/pull/222)
+* Add `CircuitField` implementations for `k256::Fp` and `k256::Fq` [#192](https://github.com/midnightntwrk/midnight-zk/pull/192)
+
+### Changed
+* Optimize `msm_by_bounded_scalars` in foreign ECC chip [#227](https://github.com/midnightntwrk/midnight-zk/pull/227)
+* Make handling of fixed_bases more robust in verifier gadget [#212](https://github.com/midnightntwrk/midnight-zk/pull/212)
 * Change nr of bits to represent JubJub scalar field modulus from 255 -> 252 [#179](https://github.com/midnightntwrk/midnight-zk/pull/179)
 * Adapt Poseidon variable length hash to agree with its CPU version [#162](https://github.com/midnightntwrk/midnight-zk/pull/162)
 * Refactor `hash` and `varhash` tests [#162](https://github.com/midnightntwrk/midnight-zk/pull/162)
@@ -24,9 +35,17 @@ verification keys break backwards compatibility.
 * Remove zeta consti in  `CircuitCurve` [#186](https://github.com/midnightntwrk/midnight-zk/pull/186)
 * Uniform input sizes for hash cost-model [#183](https://github.com/midnightntwrk/midnight-zk/pull/183)
 * Updated Rust toolchain to 1.90.0 [#210](https://github.com/midnightntwrk/midnight-zk/pull/210)
+* Bumped midnight-proofs version to support logup [#153](https://github.com/midnightntwrk/midnight-zk/pull/153)
+* CircuitField fixes [#214](https://github.com/midnightntwrk/midnight-zk/pull/214)
+* Replace native `secp256k1` types with `k256` [#192](https://github.com/midnightntwrk/midnight-zk/pull/192)
+* `CircuitField::modulus()` computed from field arith instead of parsing `PrimeField::MODULUS` [#192](https://github.com/midnightntwrk/midnight-zk/pull/192)
+* Fix `from_bytes_le` [#226](https://github.com/midnightntwrk/midnight-zk/pull/226)
+* Implemented linearization prover [#190](https://github.com/midnightntwrk/midnight-zk/pull/190)
+* Use logup with the selector variant [#220](https://github.com/midnightntwrk/midnight-zk/pull/220)
 
 ### Removed
 * Move external implementations to zk-stdlib [#178](https://github.com/midnightntwrk/midnight-zk/pull/178)
+* Remove native `secp256k1` `CircuitCurve` and `WeierstrassCurve` implementations [#216](https://github.com/midnightntwrk/midnight-zk/pull/216)
 
 ## [6.0.0] - 18-12-2025
 ### Added

@@ -14,7 +14,24 @@ use rand_core::RngCore;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
 use super::fp2::Fp2;
-use crate::serde_traits::SerdeObject;
+use crate::{ff_ext::ExtField, serde_traits::SerdeObject, utils::U384};
+
+pub const NEGATIVE_ONE: Fp = Fp::from_unchecked([
+    0xb9fe_ffff_ffff_aaaa,
+    0x1eab_fffe_b153_ffff,
+    0x6730_d2a0_f6b0_f624,
+    0x6477_4b84_f385_12bf,
+    0x4b1b_a7b6_434b_acd7,
+    0x1a01_11ea_397f_e69a,
+]);
+
+impl ExtField for Fp {
+    const NON_RESIDUE: Self = NEGATIVE_ONE;
+    fn mul_by_nonresidue(&self) -> Self {
+        self.neg()
+    }
+    fn frobenius_map(&mut self, _: usize) {}
+}
 
 // Little-endian non-Montgomery form.
 const MODULUS: [u64; NUM_LIMBS] = [
@@ -67,29 +84,29 @@ const R: Fp = Fp(blst_fp {
 
 // These constant is needed to implement [`FormUniformBytes`].
 // It is left here in case the trait is implemented in the future.
-// /// R2 = 2^(384*2) mod p
-// const R2: Fp = Fp(blst_fp {
-//     l: [
-//         0xf4df_1f34_1c34_1746,
-//         0x0a76_e6a6_09d1_04f1,
-//         0x8de5_476c_4c95_b6d5,
-//         0x67eb_88a9_939d_83c0,
-//         0x9a79_3e85_b519_952d,
-//         0x1198_8fe5_92ca_e3aa,
-//     ],
-// });
-//
-// /// R3 = 2^(384*3) mod p
-// const R3: Fp = Fp(blst_fp {
-//     l: [
-//         0xed48_ac6b_d94c_a1e0,
-//         0x315f_831e_03a7_adf8,
-//         0x9a53_352a_615e_29dd,
-//         0x34c0_4e5e_921e_1761,
-//         0x2512_d435_6572_4728,
-//         0x0aa6_3460_9175_5d4d,
-//     ],
-// });
+/// R2 = 2^(384*2) mod p
+const R2: Fp = Fp(blst_fp {
+    l: [
+        0xf4df_1f34_1c34_1746,
+        0x0a76_e6a6_09d1_04f1,
+        0x8de5_476c_4c95_b6d5,
+        0x67eb_88a9_939d_83c0,
+        0x9a79_3e85_b519_952d,
+        0x1198_8fe5_92ca_e3aa,
+    ],
+});
+
+/// R3 = 2^(384*3) mod p
+const R3: Fp = Fp(blst_fp {
+    l: [
+        0xed48_ac6b_d94c_a1e0,
+        0x315f_831e_03a7_adf8,
+        0x9a53_352a_615e_29dd,
+        0x34c0_4e5e_921e_1761,
+        0x2512_d435_6572_4728,
+        0x0aa6_3460_9175_5d4d,
+    ],
+});
 
 /// `Fp` values are always in Montgomery form; i.e., Fp(a) = aR mod p, with R =
 /// 2^384. `blst_fp.l` is in little-endian `u64` limbs format.
@@ -98,7 +115,7 @@ const R: Fp = Fp(blst_fp {
 pub struct Fp(pub(crate) blst_fp);
 
 // Coefficients for the Frobenius automorphism.
-pub(crate) const FROBENIUS_COEFF_FP2_C1: [Fp; 2] = [
+pub const FROBENIUS_COEFF_FP2_C1: [Fp; 2] = [
     // Fp(-1)**(((q^0) - 1) / 2)
     Fp(blst_fp {
         l: [
@@ -539,15 +556,25 @@ fn is_valid_u64(le_bytes: &[u64; 6]) -> bool {
     false
 }
 
-fn u64s_from_bytes(bytes: &[u8; 48]) -> [u64; 6] {
-    [
-        u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-        u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-        u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-        u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-        u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
-        u64::from_le_bytes(bytes[40..].try_into().unwrap()),
-    ]
+const fn u64s_from_bytes(bytes: &[u8; 48]) -> [u64; 6] {
+    let mut out = [0u64; 6];
+    let mut i = 0;
+
+    while i < 6 {
+        out[i] = u64::from_le_bytes([
+            bytes[i * 8],
+            bytes[i * 8 + 1],
+            bytes[i * 8 + 2],
+            bytes[i * 8 + 3],
+            bytes[i * 8 + 4],
+            bytes[i * 8 + 5],
+            bytes[i * 8 + 6],
+            bytes[i * 8 + 7],
+        ]);
+        i += 1;
+    }
+
+    out
 }
 
 const NUM_BITS: u32 = 381;
@@ -616,6 +643,18 @@ impl Field for Fp {
 }
 
 impl Fp {
+    pub const fn zero() -> Fp {
+        ZERO
+    }
+
+    pub const fn one() -> Fp {
+        R
+    }
+
+    pub const fn neg_one() -> Fp {
+        NEGATIVE_ONE
+    }
+
     pub fn char() -> [u8; 48] {
         MODULUS_REPR
     }
@@ -658,8 +697,19 @@ impl Fp {
     /// Constructs an element of `Fp` from a little-endian array of limbs
     /// without checking that it is canonical and without converting it to
     /// Montgomery form (i.e. without multiplying by `R`).
-    pub(super) fn from_mont_unchecked(l: [u64; 6]) -> Fp {
+    pub const fn from_mont_unchecked(l: [u64; 6]) -> Fp {
         Fp(blst_fp { l })
+    }
+
+    /// Constructs an element of `Fp` from a little-endian array of limbs
+    /// without checking that it is canonical, and converting it to
+    /// Montgomery form (i.e. multiplying by `R`).
+    pub const fn from_unchecked(val: [u64; 6]) -> Fp {
+        let value = U384::from(val);
+        let r2 = U384::from(R.0.l);
+        let modulo = U384::from(u64s_from_bytes(&MODULUS_REPR));
+        let l = value.mul(&r2).modulo_half(&modulo).value();
+        Self(blst_fp { l })
     }
 
     /// `u64s` represent a little-endian non-Montgomery form integer mod p.
@@ -723,6 +773,32 @@ impl Fp {
     #[inline]
     pub fn square_assign(&mut self) {
         unsafe { blst_fp_sqr(&mut self.0, &self.0) };
+    }
+}
+
+impl ff::FromUniformBytes<96> for Fp {
+    fn from_uniform_bytes(bytes: &[u8; 96]) -> Fp {
+        let mut wide = [0u8; 96];
+        wide[..96].copy_from_slice(bytes);
+        let (a0, a1) = wide.split_at(48);
+
+        let a0: [u64; 6] = (0..6)
+            .map(|off| u64::from_le_bytes(a0[off * 8..(off + 1) * 8].try_into().unwrap()))
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let a0 = Fp(blst_fp { l: a0 });
+
+        let a1: [u64; 6] = (0..6)
+            .map(|off| u64::from_le_bytes(a1[off * 8..(off + 1) * 8].try_into().unwrap()))
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let a1 = Fp(blst_fp { l: a1 });
+
+        // enforce non assembly impl since asm is likely to be optimized for sparse
+        // fields
+        a0.mul(R2) + a1.mul(R3)
     }
 }
 
@@ -1667,4 +1743,5 @@ mod tests {
     crate::field_testing_suite!(Fp, "constants");
     crate::field_testing_suite!(Fp, "sqrt");
     crate::field_testing_suite!(Fp, "zeta");
+    crate::field_testing_suite!(Fp, "from_uniform_bytes", 96);
 }

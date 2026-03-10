@@ -30,12 +30,16 @@
 use std::collections::BTreeMap;
 
 use ff::Field;
-use group::prime::PrimeCurveAffine;
-use midnight_curves::pairing::Engine;
 use midnight_proofs::{
     circuit::{Layouter, Value},
     plonk::Error,
-    poly::kzg::msm::DualMSM,
+    poly::{
+        kzg::{
+            msm::{DualMSM, MSMKZG},
+            params::ParamsVerifierKZG,
+        },
+        CommitmentLabel,
+    },
 };
 use num_bigint::BigUint;
 use num_traits::One;
@@ -48,7 +52,9 @@ use crate::{
     instructions::{hash::HashCPU, HashInstructions, PublicInputInstructions},
     types::{AssignedBit, InnerValue, Instantiable},
     verifier::{
+        fixed_commitment_name,
         msm::{AssignedMsm, Msm},
+        perm_commitment_name,
         utils::AssignedBoundedScalar,
         SelfEmulation,
     },
@@ -72,28 +78,82 @@ pub struct AssignedAccumulator<C: SelfEmulation> {
     pub(crate) rhs: AssignedMsm<C>,
 }
 
-impl<S: SelfEmulation> From<DualMSM<S::Engine>> for Accumulator<S> {
-    fn from(dual_msm: DualMSM<S::Engine>) -> Self {
+impl<S: SelfEmulation> Accumulator<S> {
+    /// Converts the off-circuit dual MSM into an `Accumulator<S>` by separating
+    /// the fixed-base scalars aside in a BTreeMap indexed by the base name with
+    /// a custom prefix.
+    ///
+    /// This function also takes a map of fixed bases indexed by their name,
+    /// which is used to perform a sanity check on the fixed-base scalars of the
+    /// dual MSM.
+    pub fn from_dual_msm(
+        dual_msm: DualMSM<S::Engine>,
+        prefix: &str,
+        fixed_bases: &BTreeMap<String, S::C>,
+    ) -> Self {
         let (lhs, rhs) = dual_msm.split();
 
-        let lhs: (Vec<S::C>, Vec<S::F>) = lhs.into_iter().map(|(s, b)| (*b, *s)).unzip();
-        let rhs: (Vec<S::C>, Vec<S::F>) = rhs.into_iter().map(|(s, b)| (*b, *s)).unzip();
+        let process_msm = |msm: Vec<(&CommitmentLabel, &S::F, &S::C)>| {
+            let mut bases = Vec::with_capacity(msm.len());
+            let mut scalars = Vec::with_capacity(msm.len());
+            let mut fixed_base_scalars = BTreeMap::new();
+            for (label, scalar, base) in msm {
+                match label {
+                    CommitmentLabel::Fixed(i) => {
+                        let name = fixed_commitment_name(prefix, *i);
+                        assert_eq!(fixed_bases.get(&name), Some(base));
+                        fixed_base_scalars.insert(name, *scalar);
+                    }
+                    CommitmentLabel::Permutation(i) => {
+                        let name = perm_commitment_name(prefix, *i);
+                        assert_eq!(fixed_bases.get(&name), Some(base));
+                        fixed_base_scalars.insert(name, *scalar);
+                    }
+                    CommitmentLabel::Custom(s) if s == "-G" => {
+                        assert_eq!(fixed_bases.get(s), Some(base));
+                        fixed_base_scalars.insert("-G".into(), *scalar);
+                    }
+                    _ => {
+                        bases.push(*base);
+                        scalars.push(*scalar);
+                    }
+                }
+            }
+            (bases, scalars, fixed_base_scalars)
+        };
+
+        let (lhs_bases, lhs_scalars, lhs_fixed_base_scalars) = process_msm(lhs);
+        let (rhs_bases, rhs_scalars, rhs_fixed_base_scalars) = process_msm(rhs);
 
         Accumulator {
-            lhs: Msm::from_terms(&lhs.0, &lhs.1),
-            rhs: Msm::from_terms(&rhs.0, &rhs.1),
+            lhs: Msm::new(&lhs_bases, &lhs_scalars, &lhs_fixed_base_scalars),
+            rhs: Msm::new(&rhs_bases, &rhs_scalars, &rhs_fixed_base_scalars),
         }
     }
-}
 
-impl<S: SelfEmulation> Accumulator<S> {
     /// Checks whether the accumulator, when evaluated with the provided
-    /// fixed-bases, satisfies the invariant w.r.t. the given \[τ\]₂.
-    pub fn check(&self, tau_in_g2: &S::G2Affine, fixed_bases: &BTreeMap<String, S::C>) -> bool {
-        // TODO: Share the Miller-loop?
-        let lhs = self.lhs.eval(fixed_bases).into();
-        let rhs = self.rhs.eval(fixed_bases).into();
-        S::Engine::pairing(&lhs, tau_in_g2) == S::Engine::pairing(&rhs, &S::G2Affine::generator())
+    /// fixed-bases, satisfies the pairing invariant w.r.t. the SRS verifier
+    /// parameters.
+    pub fn check(
+        &self,
+        params: &ParamsVerifierKZG<S::Engine>,
+        fixed_bases: &BTreeMap<String, S::C>,
+    ) -> bool {
+        let lhs = MSMKZG::<S::Engine>::from_base(&self.lhs.eval(fixed_bases));
+        let rhs = MSMKZG::<S::Engine>::from_base(&self.rhs.eval(fixed_bases));
+        DualMSM::new(lhs, rhs).check(params)
+    }
+
+    /// Returns a trivial accumulator that satisfies the pairing invariant.
+    ///
+    /// All scalars (variable and fixed-base) are zero, so both sides
+    /// evaluate to the identity point regardless of the bases.
+    pub fn trivial(fixed_base_names: &[String]) -> Self {
+        let zero_fixed = fixed_base_names.iter().map(|n| (n.clone(), S::F::ZERO)).collect();
+        Accumulator {
+            lhs: Msm::new(&[S::C::default()], &[S::F::ZERO], &BTreeMap::new()),
+            rhs: Msm::new(&[S::C::default()], &[S::F::ZERO], &zero_fixed),
+        }
     }
 
     /// An accumulator a given lhs and rhs terms respectively.
@@ -139,32 +199,6 @@ impl<S: SelfEmulation> Accumulator<S> {
         }
 
         acc
-    }
-
-    /// Given a set of fixed bases (a map indexed by the base name),
-    /// removes the given fixed bases from `self.rhs.bases` and their
-    /// corresponding scalar is moved to `self.rhs.fixed_base_scalars` with the
-    /// base name as key.
-    ///
-    /// The resulting Accumulator is equivalent to the original one.
-    /// Note that this function mutates self.
-    ///
-    /// Also, note that the lhs is not affected.
-    ///
-    /// # Warning
-    ///
-    /// If some of the fixed bases are repeated (different name but same point),
-    /// they are removed from `self.rhs.bases` in the order dictated by the map
-    /// `fixed_bases`.
-    ///
-    /// # Panics
-    ///    
-    /// If some base names exist as a key in `self.rhs.fixed_base_scalars`.
-    ///
-    /// If some of the provided fixed bases do not appear in `self.rhs.bases`
-    /// with the exact required multiplicity.
-    pub fn extract_fixed_bases(&mut self, fixed_bases: &BTreeMap<String, S::C>) {
-        self.rhs.extract_fixed_bases(fixed_bases);
     }
 }
 

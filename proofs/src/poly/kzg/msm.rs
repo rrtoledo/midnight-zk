@@ -2,6 +2,7 @@ use std::{any::TypeId, fmt::Debug};
 
 use ff::Field;
 use group::{Curve, Group};
+use itertools::izip;
 use midnight_curves::{
     msm::msm_best,
     pairing::{Engine, MillerLoopResult, MultiMillerLoop},
@@ -70,6 +71,38 @@ impl<E: Engine> MSMKZG<E> {
             bases: vec![*base],
             labels: vec![CommitmentLabel::NoLabel],
         }
+    }
+}
+
+impl<E: Engine + Debug> MSMKZG<E>
+where
+    E::G1Affine: CurveAffine<ScalarExt = E::Fr, CurveExt = E::G1>,
+{
+    /// Evaluates the MSM to a single point and replaces all terms with that
+    /// single point (scalar = 1, label = `NoLabel`).
+    ///
+    /// This mirrors `AssignedMsm::collapse` in the circuits crate.
+    ///
+    /// # Panics (in debug mode)
+    ///
+    /// If any term carries a label other than `NoLabel` or `Advice`.
+    //
+    // We only allow `NoLabel` or `Advice` because these types of labels are
+    // not relevant for the `verifier_gadget` in `midnight-circuits` (at least for
+    // now). Other types of labels may carry information that we do not want to lose
+    // when "collapsing".
+    pub fn collapse(&mut self) {
+        debug_assert!(
+            self.labels
+                .iter()
+                .all(|l| matches!(l, CommitmentLabel::NoLabel | CommitmentLabel::Advice(_))),
+            "collapse: all labels must be NoLabel or Advice, found: {:?}",
+            self.labels,
+        );
+        let point = self.eval();
+        self.scalars = vec![E::Fr::ONE];
+        self.bases = vec![point];
+        self.labels = vec![CommitmentLabel::NoLabel];
     }
 }
 
@@ -166,8 +199,16 @@ pub struct DualMSM<E: Engine> {
 
 /// A [DualMSM] split into left and right vectors of `(Scalar, Point)` tuples
 pub type SplitDualMSM<'a, E> = (
-    Vec<(&'a <E as Engine>::Fr, &'a <E as Engine>::G1)>,
-    Vec<(&'a <E as Engine>::Fr, &'a <E as Engine>::G1)>,
+    Vec<(
+        &'a CommitmentLabel,
+        &'a <E as Engine>::Fr,
+        &'a <E as Engine>::G1,
+    )>,
+    Vec<(
+        &'a CommitmentLabel,
+        &'a <E as Engine>::Fr,
+        &'a <E as Engine>::G1,
+    )>,
 );
 
 impl<E: MultiMillerLoop + Debug> Default for DualMSM<E>
@@ -211,8 +252,18 @@ where
 
     /// Split the [DualMSM] into `left` and `right`
     pub fn split(&self) -> SplitDualMSM<'_, E> {
-        let left = self.left.scalars.iter().zip(self.left.bases.iter()).collect();
-        let right = self.right.scalars.iter().zip(self.right.bases.iter()).collect();
+        let left = izip!(
+            self.left.labels.iter(),
+            self.left.scalars.iter(),
+            self.left.bases.iter()
+        )
+        .collect();
+        let right = izip!(
+            self.right.labels.iter(),
+            self.right.scalars.iter(),
+            self.right.bases.iter(),
+        )
+        .collect();
         (left, right)
     }
 

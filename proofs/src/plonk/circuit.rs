@@ -13,7 +13,7 @@ use std::{
 use ff::Field;
 use sealed::SealedPhase;
 
-use super::{lookup, permutation, trash, Error};
+use super::{logup, permutation, trash, Error};
 use crate::{
     circuit::{layouter::SyncDeps, Layouter, Region, Value},
     dev::metadata,
@@ -1642,12 +1642,33 @@ impl<F: Field> Gate<F> {
         &self.polys
     }
 
-    pub(crate) fn queried_selectors(&self) -> &[Selector] {
+    /// Returns the queried selectors of this gate.
+    pub fn queried_selectors(&self) -> &[Selector] {
         &self.queried_selectors
     }
 
     pub(crate) fn queried_cells(&self) -> &[VirtualCell] {
         &self.queried_cells
+    }
+}
+
+/// Type for tracking information about selectors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectorFlag(bool, Option<usize>);
+
+impl SelectorFlag {
+    /// Returns `true` if this selector flag tracks a simple selector, `false`
+    /// otherwise.
+    pub fn is_simple(&self) -> bool {
+        self.0
+    }
+
+    /// Returns an [Option] containing
+    ///  * the column index of this selector after it has been converted to a
+    ///    fixed column,
+    ///  * `None` otherwise.
+    pub fn col_idx(&self) -> Option<usize> {
+        self.1
     }
 }
 
@@ -1659,6 +1680,7 @@ pub struct ConstraintSystem<F: Field> {
     pub(crate) num_advice_columns: usize,
     pub(crate) num_instance_columns: usize,
     pub(crate) num_selectors: usize,
+    pub(crate) selector_flags: Vec<SelectorFlag>,
     pub(crate) num_challenges: usize,
 
     /// Contains the index of each advice column that is left unblinded.
@@ -1685,7 +1707,7 @@ pub struct ConstraintSystem<F: Field> {
 
     // Vector of lookup arguments, where each corresponds to a sequence of
     // input expressions and a sequence of table expressions involved in the lookup.
-    pub(crate) lookups: Vec<lookup::Argument<F>>,
+    pub(crate) lookups: Vec<logup::BatchedArgument<F>>,
 
     // Vector of trash arguments. Each contains a selector and a sequence of expressions
     // that will all be enforced to be zero when the selector is enabled. This is done
@@ -1719,7 +1741,7 @@ pub struct PinnedConstraintSystem<'a, F: Field> {
     instance_queries: &'a Vec<(Column<Instance>, Rotation)>,
     fixed_queries: &'a Vec<(Column<Fixed>, Rotation)>,
     permutation: &'a permutation::Argument,
-    lookups: &'a Vec<lookup::Argument<F>>,
+    lookups: &'a Vec<logup::BatchedArgument<F>>,
     trashcans: &'a Vec<trash::Argument<F>>,
     constants: &'a Vec<Column<Fixed>>,
     minimum_degree: &'a Option<usize>,
@@ -1790,6 +1812,7 @@ impl<F: Field> Default for ConstraintSystem<F> {
             num_advice_columns: 0,
             num_instance_columns: 0,
             num_selectors: 0,
+            selector_flags: vec![],
             num_challenges: 0,
             unblinded_advice_columns: Vec::new(),
             advice_column_phase: Vec::new(),
@@ -1810,6 +1833,19 @@ impl<F: Field> Default for ConstraintSystem<F> {
 }
 
 impl<F: Field> ConstraintSystem<F> {
+    /// Returns `true` if this constraint system contains a [SelectorFlag] of a
+    /// simple selector with the given column index.
+    pub fn has_simple_selector_col(&self, col_idx: usize) -> bool {
+        self.selector_flags
+            .iter()
+            .any(|f| f.is_simple() && f.col_idx() == Some(col_idx))
+    }
+
+    /// Returns the number of [SelectorFlag]s that track simple selectors.
+    pub fn num_simple_selectors(&self) -> usize {
+        self.selector_flags.iter().filter(|f| f.is_simple()).count()
+    }
+
     /// Obtain a pinned version of this constraint system; a structure with the
     /// minimal parameters needed to determine the rest of the constraint
     /// system.
@@ -1853,62 +1889,119 @@ impl<F: Field> ConstraintSystem<F> {
         self.permutation.add_column(column);
     }
 
-    /// Add a lookup argument for some input expressions and table columns.
+    /// Add a lookup argument for a single input expression per table column.
     ///
-    /// `table_map` returns a map between input expressions and the table
-    /// columns they need to match.
+    /// `table_map` returns a vector of maps between an input expression and the
+    /// table column it needs to match.
+    ///
+    /// If you want to batch multiple lookups to the same table column in
+    /// parallel, use [`batched_lookup`](Self::batched_lookup) instead.
     pub fn lookup<S: AsRef<str>>(
         &mut self,
         name: S,
+        selector: Option<Selector>,
         table_map: impl FnOnce(&mut VirtualCells<'_, F>) -> Vec<(Expression<F>, TableColumn)>,
+    ) -> usize {
+        self.batched_lookup(name, selector, |cells| {
+            table_map(cells).into_iter().map(|(expr, table)| (vec![expr], table)).collect()
+        })
+    }
+
+    /// Add a lookup argument for batches of input expressions to a table
+    /// column.
+    ///
+    /// `table_map` returns a vector of maps between input expressions
+    /// and the table columns they need to match.
+    pub fn batched_lookup<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        selector: Option<Selector>,
+        table_map: impl FnOnce(&mut VirtualCells<'_, F>) -> Vec<(Vec<Expression<F>>, TableColumn)>,
     ) -> usize {
         let mut cells = VirtualCells::new(self);
         let table_map = table_map(&mut cells)
             .into_iter()
-            .map(|(mut input, table)| {
-                if input.contains_simple_selector() {
-                    panic!("expression containing simple selector supplied to lookup argument");
-                }
+            .map(|(mut inputs, table)| {
                 let mut table = cells.query_fixed(table.inner(), Rotation::cur());
-                input.query_cells(&mut cells);
+                for input in inputs.iter_mut() {
+                    assert!(
+                        !input.contains_simple_selector(),
+                        "expression containing simple selector supplied to lookup argument"
+                    );
+
+                    input.query_cells(&mut cells);
+                }
                 table.query_cells(&mut cells);
-                (input, table)
+                (inputs, table)
             })
             .collect();
         let index = self.lookups.len();
 
-        self.lookups.push(lookup::Argument::new(name.as_ref(), table_map));
+        self.lookups.push(logup::BatchedArgument::new(
+            name.as_ref(),
+            selector,
+            table_map,
+        ));
 
         index
     }
 
-    /// Add a lookup argument for some input expressions and table expressions.
+    /// Add a lookup argument for a single input expression per table
+    /// expression.
     ///
-    /// `table_map` returns a map between input expressions and the table
-    /// expressions they need to match.
+    /// `table_map` returns a vector of maps between an input expression and the
+    /// table expression it needs to match.
+    ///
+    /// If you want to batch multiple lookups to the same table expression in
+    /// parallel, use [`batch_lookup_any`](Self::batch_lookup_any) instead.
     pub fn lookup_any<S: AsRef<str>>(
         &mut self,
         name: S,
+        selector: Option<Selector>,
         table_map: impl FnOnce(&mut VirtualCells<'_, F>) -> Vec<(Expression<F>, Expression<F>)>,
+    ) -> usize {
+        self.batch_lookup_any(name, selector, |cells| {
+            table_map(cells).into_iter().map(|(expr, table)| (vec![expr], table)).collect()
+        })
+    }
+
+    /// Add a lookup argument for batches of input expressions and table
+    /// expressions.
+    ///
+    /// `table_map` returns a vector of maps between input expressions (batched
+    /// together) and the table expressions they need to match.
+    pub fn batch_lookup_any<S: AsRef<str>>(
+        &mut self,
+        name: S,
+        selector: Option<Selector>,
+        table_map: impl FnOnce(&mut VirtualCells<'_, F>) -> Vec<(Vec<Expression<F>>, Expression<F>)>,
     ) -> usize {
         let mut cells = VirtualCells::new(self);
         let table_map = table_map(&mut cells)
             .into_iter()
-            .map(|(mut input, mut table)| {
-                if input.contains_simple_selector() {
-                    panic!("expression containing simple selector supplied to lookup argument");
+            .map(|(mut inputs, mut table)| {
+                for input in inputs.iter_mut() {
+                    assert!(
+                        !input.contains_simple_selector(),
+                        "expression containing simple selector supplied to lookup argument"
+                    );
+
+                    input.query_cells(&mut cells);
                 }
                 if table.contains_simple_selector() {
                     panic!("expression containing simple selector supplied to lookup argument");
                 }
-                input.query_cells(&mut cells);
                 table.query_cells(&mut cells);
-                (input, table)
+                (inputs, table)
             })
             .collect();
         let index = self.lookups.len();
 
-        self.lookups.push(lookup::Argument::new(name.as_ref(), table_map));
+        self.lookups.push(logup::BatchedArgument::new(
+            name.as_ref(),
+            selector,
+            table_map,
+        ));
 
         index
     }
@@ -2072,12 +2165,17 @@ impl<F: Field> ConstraintSystem<F> {
         // counted for this constraint system.
         assert_eq!(selectors.len(), self.num_selectors);
 
+        let nr_fixed_columns = self.num_fixed_columns();
         let (polys, selector_replacements): (Vec<_>, Vec<_>) = selectors
             .into_iter()
-            .map(|selector| {
+            .enumerate()
+            .map(|(idx, selector)| {
                 let poly =
                     selector.iter().map(|b| if *b { F::ONE } else { F::ZERO }).collect::<Vec<_>>();
                 let column = self.fixed_column();
+                if self.selector_flags[idx].is_simple() {
+                    self.selector_flags[idx] = SelectorFlag(true, Some(column.index()));
+                }
                 let rotation = Rotation::cur();
                 let expr = Expression::Fixed(FixedQuery {
                     index: Some(self.query_fixed_index(column, rotation)),
@@ -2090,6 +2188,15 @@ impl<F: Field> ConstraintSystem<F> {
 
         self.replace_selectors_with_fixed(&selector_replacements);
         self.num_selectors = 0;
+
+        // Adjust indices of simple, multiplicative selectors: after converting
+        // selectors to fixed columns, the selector index of a gate should now
+        // track the index of the corresponding fixed column
+        for gate in self.gates.iter_mut() {
+            for s in &mut gate.queried_selectors {
+                s.0 += nr_fixed_columns;
+            }
+        }
 
         (self, polys)
     }
@@ -2130,9 +2237,18 @@ impl<F: Field> ConstraintSystem<F> {
         // Substitute non-simple selectors for the real fixed columns in all
         // lookup expressions.
         for expr in self.lookups.iter_mut().flat_map(|lookup| {
-            lookup.input_expressions.iter_mut().chain(lookup.table_expressions.iter_mut())
+            lookup
+                .input_expressions
+                .iter_mut()
+                .flat_map(|input| input.iter_mut())
+                .chain(lookup.table_expressions.iter_mut())
         }) {
             replace_selectors(expr, selector_replacements, true);
+        }
+
+        // Substitute selectors in the lookup selector fields.
+        for lookup in self.lookups.iter_mut() {
+            replace_selectors(&mut lookup.selector, selector_replacements, true);
         }
 
         // Substitute selectors in all trash arguments.
@@ -2151,6 +2267,7 @@ impl<F: Field> ConstraintSystem<F> {
     pub fn selector(&mut self) -> Selector {
         let index = self.num_selectors;
         self.num_selectors += 1;
+        self.selector_flags.push(SelectorFlag(true, None));
         Selector(index, true)
     }
 
@@ -2159,6 +2276,7 @@ impl<F: Field> ConstraintSystem<F> {
     pub fn complex_selector(&mut self) -> Selector {
         let index = self.num_selectors;
         self.num_selectors += 1;
+        self.selector_flags.push(SelectorFlag(false, None));
         Selector(index, false)
     }
 
@@ -2323,9 +2441,8 @@ impl<F: Field> ConstraintSystem<F> {
     /// Compute the degree of the constraint system (the maximum degree of all
     /// constraints).
     pub fn degree(&self) -> usize {
-        [
+        let degree_without_lookup = [
             Some(self.permutation.required_degree()),
-            self.lookups.iter().map(|l| l.required_degree()).max(),
             self.trashcans.iter().map(|l| l.required_degree()).max(),
             self.gates
                 .iter()
@@ -2336,7 +2453,18 @@ impl<F: Field> ConstraintSystem<F> {
         .iter()
         .filter_map(|&d| d)
         .max()
-        .unwrap_or(1)
+        .unwrap_or(1);
+
+        // Logup may increase the degree as long as it does not go to the next
+        // power of two.
+        let degree = self
+            .lookups
+            .iter()
+            .map(|lookup| lookup.degree_batched_argument(degree_without_lookup))
+            .max()
+            .unwrap_or(degree_without_lookup);
+
+        *[degree_without_lookup, degree].iter().max().unwrap()
     }
 
     /// Compute the number of blinding factors necessary to perfectly blind
@@ -2362,14 +2490,14 @@ impl<F: Field> ConstraintSystem<F> {
         // h(x) is derived by the other evaluations so it does not reveal
         // anything; in fact it does not even appear in the proof.
 
-        // h(x_3) is also not revealed; the verifier only learns a single
-        // evaluation of a polynomial in x_1 which has h(x_3) and another random
-        // polynomial evaluated at x_3 as coefficients -- this random polynomial
-        // is "random_poly" in the vanishing argument.
-
         // Add an additional blinding factor as a slight defense against
         // off-by-one errors.
         let factors = factors + 1;
+
+        // Add an additional blinding factor as a security margin for opening
+        // the linearization polynomial in the multi-open argument
+        let factors = factors + 1;
+
         if factors > i32::MAX as usize {
             panic!("Number of blinding factors overflowed max expected value");
         }
@@ -2454,7 +2582,7 @@ impl<F: Field> ConstraintSystem<F> {
     }
 
     /// Returns lookup arguments
-    pub fn lookups(&self) -> &Vec<lookup::Argument<F>> {
+    pub fn lookups(&self) -> &Vec<logup::BatchedArgument<F>> {
         &self.lookups
     }
 

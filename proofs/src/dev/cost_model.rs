@@ -16,11 +16,13 @@ use serde_derive::Serialize;
 
 use super::Region;
 use crate::{
-    circuit,
-    circuit::Value,
+    circuit::{self, Value},
     plonk::{
-        sealed, sealed::SealedPhase, Advice, Any, Any::Fixed, Assignment, Challenge, Circuit,
-        Column, ConstraintSystem, Error, FirstPhase, FloorPlanner, Instance, Phase, Selector,
+        sealed::{self, SealedPhase},
+        Advice,
+        Any::{self, Fixed},
+        Assignment, Challenge, Circuit, Column, ConstraintSystem, Error, FirstPhase, FloorPlanner,
+        Instance, Phase, Selector,
     },
     utils::rational::Rational,
 };
@@ -88,16 +90,17 @@ impl FromStr for Poly {
 struct Lookup;
 
 impl Lookup {
-    /// Returns the queries of the lookup argument
+    /// Returns the queries of the LogUp lookup argument
     fn queries(&self) -> impl Iterator<Item = Poly> {
-        // - product commitments at x and \omega x
-        // - input commitments at x and x_inv
-        // - table commitments at x
-        let product = "0,1".parse().unwrap();
-        let input = "-1,0".parse().unwrap();
-        let table = "0".parse().unwrap();
+        // LogUp polynomials:
+        // - multiplicities at x
+        // - helper at x
+        // - aggregator at x and ωx
+        let multiplicities: Poly = "0".parse().unwrap();
+        let helper: Poly = "0".parse().unwrap();
+        let aggregator: Poly = "0,1".parse().unwrap();
 
-        iter::empty().chain(Some(product)).chain(Some(input)).chain(Some(table))
+        [multiplicities, helper, aggregator].into_iter()
     }
 }
 
@@ -183,14 +186,14 @@ impl CostOptions {
 
         // PLONK:
         // - COMM bytes (commitment) per advice column
-        // - 3 * COMM bytes per lookup
+        // - 3 * COMM bytes per lookup chunk
         // - COMM bytes per ((self.permutation.columns - 1) / (self.max_degree - 2)) + 1
         // - 3 * SCALAR bytes per ((self.permutation.columns - 1) / (self.max_degree -
         //   2)) + 1
         // - SCALAR bytes per advice per query
         // - SCALAR bytes per fixed per query <- missing
         // - SCALAR bytes per permutation column
-        // - 5 * SCALAR bytes per lookup argument
+        // - 4 * SCALAR bytes per lookup chunk
         let nb_perm_chunks =
             (self.permutation.columns.saturating_sub(1) / self.max_degree.saturating_sub(2)) + 1;
         let plonk = comp_bytes(1, 0) * self.advice.len()
@@ -204,15 +207,13 @@ impl CostOptions {
                 .iter()
                 .map(|polys| comp_bytes(0, polys.rotations.len()))
                 .sum::<usize>()
-            + comp_bytes(3, 5) * self.lookup.len()
+            + comp_bytes(3, 4) * self.lookup.len()
             + (comp_bytes(1, 3) * nb_perm_chunks).saturating_sub(comp_bytes(0, 1)) // we don't need the permutation_product_last_eval of the last chunk
             + comp_bytes(0, 1) * self.permutation.columns;
 
-        // Vanishing argument:
-        // - COMM bytes for random poly
-        // - (max_deg - 1) COMM bytes for the pieces
-        // - SCALAR bytes for random piece eval
-        let vanishing = comp_bytes(self.max_degree, 1);
+        // Commitments to quotient limbs:
+        // - (max_deg - 1) COMM bytes for the limbs
+        let limbs = comp_bytes(self.max_degree - 1, 0);
 
         // Multiopening argument:
         // - COMM bytes for f_commitment
@@ -231,7 +232,7 @@ impl CostOptions {
             nr_rotations.extend(poly.rotations.clone());
         }
 
-        let size = plonk + vanishing + multiopen;
+        let size = plonk + multiopen + limbs;
 
         CircuitModel {
             k: self.min_k,
@@ -277,7 +278,9 @@ pub(crate) fn cost_model_options<F: Ord + Field + FromUniformBytes<64>, C: Circu
         // init the fixed polynomials with no rotations
         let mut fixed = vec![Poly { rotations: vec![] }; cs.num_fixed_columns()];
         for (col, rot) in cs.fixed_queries() {
-            fixed[col.index()].rotations.push(rot.0 as isize);
+            if !cs.has_simple_selector_col(col.index()) {
+                fixed[col.index()].rotations.push(rot.0 as isize);
+            }
         }
         fixed
     };
@@ -303,7 +306,13 @@ pub(crate) fn cost_model_options<F: Ord + Field + FromUniformBytes<64>, C: Circu
         instance
     };
 
-    let lookup = { cs.lookups().iter().map(|_| Lookup).collect::<Vec<_>>() };
+    let lookup = {
+        cs.lookups()
+            .iter()
+            .flat_map(|l| l.split(cs.degree()))
+            .map(|_| Lookup)
+            .collect::<Vec<_>>()
+    };
 
     let permutation = Permutation {
         chunk_len: cs.degree() - 2,
@@ -642,7 +651,7 @@ mod tests {
             let table_selector = meta.complex_selector();
             let sl = meta.lookup_table_column();
 
-            meta.lookup("lookup", |meta| {
+            meta.lookup("lookup", None, |meta| {
                 let selector = meta.query_selector(table_selector);
                 let not_selector = Expression::from(1) - selector.clone();
                 let advice = meta.query_advice(a, Rotation::cur());
@@ -807,8 +816,8 @@ mod tests {
                         let circuit = StandardPlonk::<NB_PI>(Fq::from(random_byte[0] as u64));
                         let cost_model = cost_model_options(&circuit);
 
-                        // nb of unusable rows for this circuit is 6.
-                        let pi_k = (NB_PI + 6).next_power_of_two().ilog2();
+                        // nb of unusable rows for this circuit is 7.
+                        let pi_k = (NB_PI + 7).next_power_of_two().ilog2();
                         assert_eq!(cost_model.min_k, max(9, pi_k));
                     }
                 )*
