@@ -124,7 +124,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
             res
         });
 
-        // let _committed_f: CS::Commitment = transcript.read()?;
+        let _committed_f: CS::Commitment = transcript.read()?;
         let alpha: F = transcript.squeeze_challenge();
         let eval_commited_f: F = transcript.read()?;
 

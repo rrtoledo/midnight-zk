@@ -172,7 +172,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
         println!("Time poly f: {:?}", now.elapsed());
 
         // // Now we commit to it
-        // transcript.write(&CS::commit(params, &f_poly))?;
+        transcript.write(&CS::commit(params, &f_poly))?;
         // println!("Time to commit to the zero polynomial (and write to transcript):
         // {:?}", now.elapsed());
 
