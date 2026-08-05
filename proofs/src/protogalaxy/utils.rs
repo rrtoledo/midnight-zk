@@ -256,6 +256,11 @@ impl<F: PrimeField> Add<&FoldingProverTrace<F>> for FoldingProverTrace<F> {
                 .for_each(|(lhs, rhs)| {
                     *lhs += rhs;
                 });
+            (self.instance_values[i].par_iter_mut())
+                .zip(rhs.instance_values[i].par_iter())
+                .for_each(|(lhs, rhs)| {
+                    *lhs += rhs;
+                });
             self.lookups[i]
                 .par_iter_mut()
                 .zip(rhs.lookups[i].par_iter())
@@ -305,6 +310,9 @@ impl<F: PrimeField> Mul<F> for FoldingProverTrace<F> {
                 *p *= scalar;
             });
             self.instance_polys[i].par_iter_mut().for_each(|p| {
+                *p *= scalar;
+            });
+            self.instance_values[i].par_iter_mut().for_each(|p| {
                 *p *= scalar;
             });
             self.lookups[i].par_iter_mut().for_each(|lhs| {
