@@ -149,7 +149,27 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
                 xn,
                 -max_rotation..max_instance_len as i32 + min_rotation.abs(),
             );
-            instances
+            // For non-committed columns, each of the `instances.len()` ORIGINAL
+            // (pre-fold) proofs has its own raw public input; evaluating it at
+            // the rotation-adjusted point `x` (as done below, per proof) is
+            // only the first of two interpolations needed. The result must
+            // ALSO be folded across proofs at `pg_gamma` (the same weighting
+            // `fold_traces` applies to every other folded quantity), since the
+            // single evaluation this verifier is finally checking corresponds
+            // to the FOLDED instance, not to any one original proof.
+            // `VerifierFoldingTrace` carries no instance field to read this
+            // from directly (instances are public, so there's nothing to
+            // commit to), hence recomputing it here from the raw `instances`.
+            let lagranges_in_gamma: Vec<F> = (0..instances.len())
+                .map(|i| {
+                    let mut l = dk_domain.empty_lagrange();
+                    l[i] = F::ONE;
+                    dk_domain.lagrange_to_coeff(l)
+                })
+                .map(|poly| eval_polynomial(&poly, pg_gamma))
+                .collect();
+
+            let per_proof_evals = instances
                 .iter()
                 .map(|instances| {
                     vk.cs
@@ -157,7 +177,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
                         .iter()
                         .map(|(column, rotation)| {
                             if column.index() < nb_committed_instances {
-                                transcript.read()
+                                Ok(F::ZERO)
                             } else {
                                 let instances = instances[column.index() - nb_committed_instances];
                                 let offset = (max_rotation - rotation.0) as usize;
@@ -169,7 +189,30 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<Vec<F>>, Error>>()?;
+
+            // The final proof is a single (folded) proof, so committed-instance
+            // evaluations are read from the transcript exactly once per query
+            // (not once per original proof).
+            let folded = vk
+                .cs
+                .instance_queries
+                .iter()
+                .enumerate()
+                .map(|(q, (column, _))| {
+                    if column.index() < nb_committed_instances {
+                        transcript.read()
+                    } else {
+                        Ok(per_proof_evals
+                            .iter()
+                            .zip(lagranges_in_gamma.iter())
+                            .map(|(evals, l)| evals[q] * l)
+                            .sum())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            vec![folded]
         };
 
         let advice_evals = (0..num_proofs)
