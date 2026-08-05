@@ -782,4 +782,200 @@ mod tests {
 
         println!("Folding was a success");
     }
+
+    #[derive(Clone, Copy)]
+    struct TestCircuitWithInstance {
+        witness: [Value<Fq>; 1 << 8],
+    }
+
+    impl TestCircuitWithInstance {
+        fn from(witness: [Value<Fq>; 1 << 8]) -> Self {
+            Self { witness }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct MyConfig2 {
+        mul_selector: Selector,
+        table_selector: Selector,
+        table: TableColumn,
+        a: Column<Advice>,
+        b: Column<Advice>,
+        c: Column<Advice>,
+        instance: Column<crate::plonk::Instance>,
+    }
+
+    impl Circuit<Fq> for TestCircuitWithInstance {
+        type Config = MyConfig2;
+        type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "circuit-params")]
+        type Params = ();
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                witness: [Value::unknown(); 1 << 8],
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fq>) -> MyConfig2 {
+            let config = MyConfig2 {
+                mul_selector: meta.complex_selector(),
+                table_selector: meta.complex_selector(),
+                table: meta.lookup_table_column(),
+                a: meta.advice_column(),
+                b: meta.advice_column(),
+                c: meta.advice_column(),
+                instance: meta.instance_column(),
+            };
+
+            meta.enable_equality(config.a);
+            meta.enable_equality(config.b);
+            meta.enable_equality(config.instance);
+
+            meta.create_gate("mul", |meta| {
+                let a = meta.query_advice(config.a, Rotation::cur());
+                let b = meta.query_advice(config.b, Rotation::cur());
+                let c = meta.query_advice(config.c, Rotation::cur());
+                Constraints::with_selector(config.mul_selector, vec![a * b - c])
+            });
+
+            meta.lookup("lookup", |meta| {
+                let selector = meta.query_selector(config.table_selector);
+                let not_selector = Expression::Constant(Fq::ONE) - selector.clone();
+
+                let a = meta.query_advice(config.a, Rotation::cur());
+                vec![(selector * a + not_selector, config.table)]
+            });
+
+            config
+        }
+
+        fn synthesize(
+            &self,
+            config: MyConfig2,
+            mut layouter: impl Layouter<Fq>,
+        ) -> Result<(), Error> {
+            layouter.assign_table(
+                || "8-bit table",
+                |mut table| {
+                    for row in 0u64..(1 << 8) {
+                        table.assign_cell(
+                            || format!("row {row}"),
+                            config.table,
+                            row as usize,
+                            || Value::known(Fq::from(row + 1)),
+                        )?;
+                    }
+
+                    Ok(())
+                },
+            )?;
+
+            let first_cell = layouter.assign_region(
+                || "assign values",
+                |mut region| {
+                    let mut first_cell = None;
+                    for (offset, val) in self.witness.into_iter().enumerate() {
+                        config.table_selector.enable(&mut region, offset)?;
+                        config.mul_selector.enable(&mut region, offset)?;
+                        let a = region.assign_advice(|| "a", config.a, offset, || val)?;
+                        a.copy_advice(|| "copy a to b", &mut region, config.b, offset)?;
+                        region.assign_advice(|| "c", config.c, offset, || val.map(|v| v * v))?;
+                        if offset == 0 {
+                            first_cell = Some(a.cell());
+                        }
+                    }
+
+                    Ok(first_cell.unwrap())
+                },
+            )?;
+            layouter.constrain_instance(first_cell, config.instance, 0)?;
+
+            Ok(())
+        }
+    }
+
+    /// Analogous to `protogalaxy::prover::tests::folding_test_with_instance`,
+    /// but exercising the one-shot API instead. Folding real, differing
+    /// per-instance public inputs via `ProtogalaxyProverOneShot`/
+    /// `ProtogalaxyVerifierOneShot` -- unlike `folding_test_oneshot` above,
+    /// which only ever folds circuits with empty instances.
+    #[test]
+    fn folding_test_oneshot_with_instance() {
+        const K: usize = 15;
+        let k = 4; // number of folding instances
+
+        let rng = ChaCha8Rng::from_seed([0u8; 32]);
+        let params: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K as u32, rng);
+
+        let mut rng = ChaCha8Rng::from_seed([0u8; 32]);
+
+        let all_witnesses = (0..k)
+            .map(|_| {
+                let mut bytes = [0u8; 1 << 8];
+                rng.fill_bytes(&mut bytes);
+                bytes
+                    .into_iter()
+                    .map(|byte| Value::known(Fq::from((byte as u64) + 1)))
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap()
+            })
+            .collect::<Vec<[Value<Fq>; 1 << 8]>>();
+
+        let public_inputs = all_witnesses
+            .iter()
+            .map(|w: &[Value<Fq>; 1 << 8]| {
+                let mut val = Fq::ZERO;
+                w[0].map(|v| val = v);
+                vec![val]
+            })
+            .collect::<Vec<_>>();
+
+        let circuits =
+            all_witnesses.into_iter().map(TestCircuitWithInstance::from).collect::<Vec<_>>();
+
+        let vk =
+            keygen_vk_with_k::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuits[0], K as u32)
+                .expect("keygen_vk should not fail");
+        let pk = keygen_pk(vk.clone(), &circuits[0]).expect("keygen_pk should not fail");
+
+        let mut rng = ChaCha8Rng::from_seed([0u8; 32]);
+        let mut transcript = CircuitTranscript::init();
+
+        ProtogalaxyProverOneShot::<_, _, K>::fold(
+            &params,
+            pk.clone(),
+            circuits,
+            0,
+            &[
+                &[public_inputs[0].as_slice()],
+                &[public_inputs[1].as_slice()],
+                &[public_inputs[2].as_slice()],
+                &[public_inputs[3].as_slice()],
+            ],
+            &mut rng,
+            &mut transcript,
+        )
+        .expect("Failed to fold many instances");
+
+        let mut transcript = CircuitTranscript::init_from_bytes(&transcript.finalize());
+
+        ProtogalaxyVerifierOneShot::<_, _, K>::fold(
+            &vk,
+            &[&[], &[], &[], &[]],
+            &[
+                &[public_inputs[0].as_slice()],
+                &[public_inputs[1].as_slice()],
+                &[public_inputs[2].as_slice()],
+                &[public_inputs[3].as_slice()],
+            ],
+            &mut transcript,
+        )
+        .expect("Failed to fold instances by the verifier")
+        .verify(&params.verifier_params())
+        .expect("Verification failed");
+
+        println!("Folding was a success (with-instance variant)");
+    }
 }
