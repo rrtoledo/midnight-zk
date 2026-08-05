@@ -217,6 +217,13 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
         // When constructing the vanishing polynomial, we need to correct the identity.
         let correction = domain.coeff_to_extended(error_coeff.clone());
         let h = h_poly - &correction;
+        // NOTE: `vanishing.random_poly` here is always the zero placeholder
+        // from `FoldingProverTrace::init` (never replaced with real
+        // randomness, since we don't call `vanishing::Argument::commit`
+        // anywhere in the folding path) — see the module-level "no
+        // zero-knowledge" note in `protogalaxy/mod.rs`. `.construct()` below
+        // does not re-randomize it, so this proof's h(X) commitment carries
+        // no blinding.
         let vanishing = vanishing.construct::<CS, T>(params, domain, h, transcript)?;
 
         let x: F = transcript.squeeze_challenge();

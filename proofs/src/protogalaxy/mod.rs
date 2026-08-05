@@ -1,4 +1,23 @@
 //! TODO
+//!
+//! # Known limitation: no zero-knowledge in the one-shot prover
+//!
+//! [prover_oneshot::ProtogalaxyProverOneShot] does not currently implement
+//! zero-knowledge blinding for its final, self-contained proof's vanishing
+//! argument. The `vanishing.random_poly` field carried through
+//! [FoldingProverTrace] is always a zero placeholder (it is never populated
+//! by [crate::plonk::vanishing::Argument::commit], which is what generates
+//! real blinding randomness for a standalone PLONK proof) — it flows
+//! unchanged from folding into the final proof's
+//! `vanishing::prover::Committed`, whose `.construct()` call only builds and
+//! commits to `h(X)` pieces without re-randomizing it. This does not affect
+//! soundness (verification still correctly rejects invalid/tampered proofs),
+//! but it means the one-shot folded proof's `h(X)` commitment carries no
+//! blinding, so it may leak information about the underlying witness that a
+//! properly blinded proof would not. (The non-one-shot
+//! [prover::ProtogalaxyProver] does not reach this stage at all — it returns
+//! an intermediate object rather than a finalized proof, so this limitation
+//! is specific to the one-shot path.)
 
 use ff::{PrimeField, WithSmallOrderMulGroup};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
