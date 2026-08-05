@@ -135,21 +135,16 @@ where
     buffer * c
 }
 
-/// A folding trace where, instead of field elements, we have polynomials.
-/// It is represented as a vector of folding traces, where the i-th folding
-/// trace represents the evaluation of the polynomial at the i-th domain point.
-pub type LiftedFoldingTrace<F> = Vec<FoldingProverTrace<F>>;
-
 /// Computes \sum_{j = 0}^k L_j(X) ω_j, where ω_j is the j-th trace,
 /// for j = 0, ..., k. The `degree` is the maximum degree of the
 /// constraint system.
 ///
-/// TODO: Improve the memory peak that this function leads to.
-/// We could handle each output folding trace one by one instead.
-pub fn batch_traces<F: PrimeField + WithSmallOrderMulGroup<3>>(
-    dk_domain: &EvaluationDomain<F>,
-    traces: &[&FoldingProverTrace<F>],
-) -> LiftedFoldingTrace<F> {
+/// Returns a lazy iterator of folding traces where, instead of field elements, we have polynomials. It is represented as an iterator of folding traces, where the i-th folding
+/// trace represents the evaluation of the polynomial at the i-th domain point.
+pub fn batch_traces<'a, F: PrimeField + WithSmallOrderMulGroup<3>>(
+    dk_domain: &'a EvaluationDomain<F>,
+    traces: &'a [&'a FoldingProverTrace<F>],
+) -> impl ExactSizeIterator<Item = FoldingProverTrace<F>> + 'a {
     let lagrange_polys = (0..traces.len())
         .map(|i| {
             // For the moment we only support batching of traces of dimension one.
@@ -165,15 +160,13 @@ pub fn batch_traces<F: PrimeField + WithSmallOrderMulGroup<3>>(
     let dk_domain_size = lagrange_polys[0].num_coeffs();
     assert_eq!(dk_domain_size, dk_domain.extended_len());
 
-    (0..dk_domain.extended_len())
-        .map(|i| {
-            let buffer = FoldingProverTrace::with_same_dimensions(traces[0]);
-            let coordinate_i_lagrange =
-                lagrange_polys.iter().map(|poly| poly.values[i]).collect::<Vec<_>>();
+    (0..dk_domain.extended_len()).map(move |i| {
+        let buffer = FoldingProverTrace::with_same_dimensions(traces[0]);
+        let coordinate_i_lagrange =
+            lagrange_polys.iter().map(|poly| poly.values[i]).collect::<Vec<_>>();
 
-            linear_combination(buffer, traces, &coordinate_i_lagrange)
-        })
-        .collect()
+        linear_combination(buffer, traces, &coordinate_i_lagrange)
+    })
 }
 
 impl<F: PrimeField> FoldingProverTrace<F> {

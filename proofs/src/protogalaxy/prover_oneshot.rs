@@ -345,9 +345,9 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
             vec![vec![F::ZERO; folding_pk.domain.n as usize]; lifted_folding_trace.len()];
         let g_poly = g_poly_unbatched
             .iter_mut()
-            .zip(lifted_folding_trace.iter())
+            .zip(lifted_folding_trace)
             .map(|(instance, trace)| {
-                let witness_poly = folding_pk.compute_h(trace);
+                let witness_poly = folding_pk.compute_h(&trace);
                 *instance = witness_poly.values;
 
                 instance

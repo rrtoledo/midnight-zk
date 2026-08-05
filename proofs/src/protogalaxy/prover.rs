@@ -340,8 +340,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
         let lift_trace_time = time.elapsed().as_millis();
 
         let values = lifted_trace
-            .iter()
-            .map(|trace| self.compute_error(trace, beta))
+            .map(|trace| self.compute_error(&trace, beta))
             .collect::<Vec<_>>();
 
         let poly_g_time = time.elapsed().as_millis() - lift_trace_time;
