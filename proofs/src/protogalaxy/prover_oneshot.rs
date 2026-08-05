@@ -20,7 +20,7 @@ use crate::{
         LagrangeCoeff, Polynomial, ProverQuery,
     },
     protogalaxy::{
-        utils::{batch_traces, linear_combination},
+        utils::{batch_traces, lagrange_evals_at, linear_combination},
         FoldingPk,
     },
     utils::arithmetic::eval_polynomial,
@@ -111,7 +111,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
         let folding_pk = FoldingPk::from(pk.clone());
 
         // Compute evaluations of lagrange polynomials on beta_pg
-        let lagrange_on_beta: Vec<F> = eval_lagrange_on_beta(pk.vk.get_domain(), &beta_pg);
+        let lagrange_on_beta: Vec<F> = lagrange_evals_at(pk.vk.get_domain(), &beta_pg);
         let lagrange_beta_time = time.elapsed().as_millis();
 
         let (poly_g, poly_g_unbatched) =
@@ -415,23 +415,11 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
         traces: &[&FoldingProverTrace<F>],
         gamma: &F,
     ) -> FoldingProverTrace<F> {
-        let lagrange_polys = (0..traces.len())
-            .map(|i| {
-                // For the moment we only support batching of traces of dimension one.
-                // David: what does this mean?
-                assert_eq!(traces[i].advice_polys.len(), 1);
-                let mut l = dk_domain.empty_lagrange();
-                l[i] = F::ONE;
-                l
-            })
-            .map(|p| dk_domain.lagrange_to_coeff(p))
-            .collect::<Vec<_>>();
+        // For the moment we only support batching of traces of dimension one.
+        assert!(traces.iter().all(|t| t.advice_polys.len() == 1));
 
+        let lagranges_in_gamma = lagrange_evals_at(dk_domain, gamma);
         let buffer = FoldingProverTrace::with_same_dimensions(traces[0]);
-        let lagranges_in_gamma = lagrange_polys
-            .iter()
-            .map(|poly| eval_polynomial(poly, *gamma))
-            .collect::<Vec<_>>();
 
         linear_combination(buffer, traces, &lagranges_in_gamma)
     }
@@ -471,40 +459,6 @@ fn compute_error_terms<F: PrimeField + WithSmallOrderMulGroup<3>>(
         .collect::<Vec<F>>() // collect the results into a Vec<F>
 }
 
-/// Computes the lagrange polynomials for a domain (with root omega)
-/// Then, it evaluates them at 'beta', obtaining a vector of coefficients.
-/// It uses the formula: L_i(beta) = Z(beta) * omega^i / (n * (beta - omega^i))
-/// We decompose it into a fixed part [Z(beta) / n] and a variable part [omega^i / (beta - omega^i)]
-pub fn eval_lagrange_on_beta<F: PrimeField + WithSmallOrderMulGroup<3>>(
-    domain: &EvaluationDomain<F>,
-    beta: &F,
-) -> Vec<F> {
-    let pk_domain_size = domain.n as usize;
-    let omega: F = domain.get_omega(); // generator of multiplicative subgroup
-
-    let n_fe = F::from(pk_domain_size as u64);
-    
-    // fixed_term = Z(beta) / n = (beta^n - 1) / n
-    let fixed_term = (beta.pow([pk_domain_size as u64]) - F::ONE) * n_fe.invert().unwrap();
-
-    // Calculate all the omega powers and store them in a vector
-    // TODO: parallelize? We could start from powers omega^0, omega^m, omega^2m, ...
-    // Where for a domain of size n, m = n / #threads
-    let mut omegas: Vec<F> = Vec::with_capacity(pk_domain_size);
-    omegas.push(F::ONE);
-    for _ in 0..(pk_domain_size - 1) {
-        omegas.push(*omegas.last().unwrap() * omega);
-    }
-
-    let result = omegas.into_par_iter()
-        .map(|omega_i| {
-            fixed_term * omega_i * (*beta - omega_i).invert().unwrap()
-        })
-        .collect();
-    result
-}
-
-
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -525,7 +479,8 @@ mod tests {
             Rotation,
         },
         protogalaxy::{
-            prover_oneshot::{ProtogalaxyProverOneShot, eval_lagrange_on_beta}, 
+            prover_oneshot::ProtogalaxyProverOneShot,
+            utils::lagrange_evals_at,
             verifier_oneshot::ProtogalaxyVerifierOneShot,
         },
         transcript::{CircuitTranscript, Transcript},
@@ -679,7 +634,7 @@ mod tests {
 
         let beta = Fq::from(rand::random::<u64>());
 
-        let lagrange_on_beta = eval_lagrange_on_beta(&vk.get_domain(), &beta);
+        let lagrange_on_beta = lagrange_evals_at(&vk.get_domain(), &beta);
 
         // Now we compute the same values using lagrange polynomials
         let mut lagrange_polys = Vec::with_capacity(pk_domain_size);

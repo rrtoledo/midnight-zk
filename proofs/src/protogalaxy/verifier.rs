@@ -12,7 +12,7 @@ use crate::{
         Error, Evaluator, VerifyingKey,
     },
     poly::{commitment::PolynomialCommitmentScheme, EvaluationDomain, LagrangeCoeff, Polynomial},
-    protogalaxy::utils::{linear_combination, pow_vec},
+    protogalaxy::utils::{lagrange_evals_at, linear_combination, pow_vec},
     transcript::{Hashable, Sampleable, Transcript},
     utils::arithmetic::eval_polynomial,
 };
@@ -243,16 +243,10 @@ fn fold_traces<F: WithSmallOrderMulGroup<3>, PCS: PolynomialCommitmentScheme<F>>
     traces: &[&VerifierFoldingTrace<F, PCS>],
     gamma: &F,
 ) -> VerifierFoldingTrace<F, PCS> {
-    let lagrange_polys = (0..traces.len())
-        .map(|i| {
-            // For the moment we only support batching of traces of dimension one.
-            assert_eq!(traces[i].advice_commitments.len(), 1);
-            let mut l = dk_domain.empty_lagrange();
-            l[i] = F::ONE;
-            l
-        })
-        .map(|p| dk_domain.lagrange_to_coeff(p))
-        .collect::<Vec<_>>();
+    // For the moment we only support batching of traces of dimension one.
+    assert!(traces.iter().all(|t| t.advice_commitments.len() == 1));
+
+    let lagranges_in_gamma = lagrange_evals_at(dk_domain, gamma);
 
     let buffer = VerifierFoldingTrace::init(
         traces[0].fixed_commitments.len(),
@@ -264,10 +258,6 @@ fn fold_traces<F: WithSmallOrderMulGroup<3>, PCS: PolynomialCommitmentScheme<F>>
         traces[0].theta.len(),
         traces[0].y.len(),
     );
-    let lagranges_in_gamma = lagrange_polys
-        .iter()
-        .map(|poly| eval_polynomial(poly, *gamma))
-        .collect::<Vec<_>>();
 
     linear_combination(buffer, traces, &lagranges_in_gamma)
 }

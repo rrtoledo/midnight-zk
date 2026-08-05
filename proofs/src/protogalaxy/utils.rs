@@ -2,7 +2,8 @@ use std::ops::{Add, Mul};
 
 use ff::{Field, PrimeField, WithSmallOrderMulGroup};
 use rayon::iter::{
-    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator,
 };
 
 use crate::{
@@ -25,6 +26,43 @@ pub(crate) fn pow_vec<F: Field>(vector: &[F]) -> Vec<F> {
         res.extend(res.clone().iter().map(|v| *v * x));
     }
     res
+}
+
+/// Evaluates every Lagrange basis polynomial of `domain` (i.e. `L_i` for `i`
+/// in `0..domain.n`, where `L_i(omega^i) = 1` and `L_i` vanishes on every
+/// other point of `domain`) at `point`, via the barycentric/vanishing-poly
+/// closed form:
+///
+/// ```text
+/// L_i(point) = (point^n - 1) / n * omega^i / (point - omega^i)
+/// ```
+///
+/// This is `O(n)` (plus one inversion per basis element), as opposed to
+/// building each `L_i` as a polynomial via an FFT and evaluating it
+/// separately, which is `O(n log n)`.
+pub(crate) fn lagrange_evals_at<F: PrimeField + WithSmallOrderMulGroup<3>>(
+    domain: &EvaluationDomain<F>,
+    point: &F,
+) -> Vec<F> {
+    let n = domain.n as usize;
+    let omega: F = domain.get_omega();
+
+    let n_fe = F::from(n as u64);
+    let fixed_term = (point.pow([n as u64]) - F::ONE) * n_fe.invert().unwrap();
+
+    // Compute all the powers of omega.
+    // TODO: parallelize? We could start from powers omega^0, omega^m, omega^2m, ...
+    // Where for a domain of size n, m = n / #threads
+    let mut omegas: Vec<F> = Vec::with_capacity(n);
+    omegas.push(F::ONE);
+    for _ in 0..(n - 1) {
+        omegas.push(*omegas.last().unwrap() * omega);
+    }
+
+    omegas
+        .into_par_iter()
+        .map(|omega_i| fixed_term * omega_i * (*point - omega_i).invert().unwrap())
+        .collect()
 }
 
 /// Computes a linear combination between the elements and the scalars.

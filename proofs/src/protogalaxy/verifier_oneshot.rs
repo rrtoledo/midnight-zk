@@ -17,9 +17,9 @@ use crate::{
         commitment::PolynomialCommitmentScheme, EvaluationDomain, LagrangeCoeff, Polynomial,
         VerifierQuery,
     },
-    protogalaxy::{prover_oneshot::eval_lagrange_on_beta, utils::linear_combination},
+    protogalaxy::utils::{lagrange_evals_at, linear_combination},
     transcript::{read_n, Hashable, Sampleable, Transcript},
-    utils::arithmetic::{compute_inner_product, eval_polynomial},
+    utils::arithmetic::compute_inner_product,
 };
 
 /// This verifier can perform a 2**K - 1 to one folding
@@ -160,14 +160,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
             // `VerifierFoldingTrace` carries no instance field to read this
             // from directly (instances are public, so there's nothing to
             // commit to), hence recomputing it here from the raw `instances`.
-            let lagranges_in_gamma: Vec<F> = (0..instances.len())
-                .map(|i| {
-                    let mut l = dk_domain.empty_lagrange();
-                    l[i] = F::ONE;
-                    dk_domain.lagrange_to_coeff(l)
-                })
-                .map(|poly| eval_polynomial(&poly, pg_gamma))
-                .collect();
+            let lagranges_in_gamma: Vec<F> = lagrange_evals_at(&dk_domain, &pg_gamma);
 
             let per_proof_evals = instances
                 .iter()
@@ -482,7 +475,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
         );
 
         // let beta_coeffs: Vec<F> = vec![self.beta.clone(); 1 << K];
-        let beta_coeffs: Vec<F> = eval_lagrange_on_beta(vk.get_domain(), &self.beta);
+        let beta_coeffs: Vec<F> = lagrange_evals_at(vk.get_domain(), &self.beta);
 
         let expected_result = witness_poly
             .values
@@ -505,16 +498,10 @@ fn fold_traces<F: WithSmallOrderMulGroup<3>, PCS: PolynomialCommitmentScheme<F>>
     traces: &[&VerifierFoldingTrace<F, PCS>],
     gamma: &F,
 ) -> VerifierFoldingTrace<F, PCS> {
-    let lagrange_polys = (0..traces.len())
-        .map(|i| {
-            // For the moment we only support batching of traces of dimension one.
-            assert_eq!(traces[i].advice_commitments.len(), 1);
-            let mut l = dk_domain.empty_lagrange();
-            l[i] = F::ONE;
-            l
-        })
-        .map(|p| dk_domain.lagrange_to_coeff(p))
-        .collect::<Vec<_>>();
+    // For the moment we only support batching of traces of dimension one.
+    assert!(traces.iter().all(|t| t.advice_commitments.len() == 1));
+
+    let lagranges_in_gamma = lagrange_evals_at(dk_domain, gamma);
 
     let buffer = VerifierFoldingTrace::init(
         traces[0].fixed_commitments.len(),
@@ -526,10 +513,6 @@ fn fold_traces<F: WithSmallOrderMulGroup<3>, PCS: PolynomialCommitmentScheme<F>>
         traces[0].theta.len(),
         traces[0].y.len(),
     );
-    let lagranges_in_gamma = lagrange_polys
-        .iter()
-        .map(|poly| eval_polynomial(poly, *gamma))
-        .collect::<Vec<_>>();
 
     linear_combination(buffer, traces, &lagranges_in_gamma)
 }
