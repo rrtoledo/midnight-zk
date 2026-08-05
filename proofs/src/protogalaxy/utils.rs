@@ -15,6 +15,7 @@ use crate::{
         trash, vanishing,
     },
     poly::{commitment::PolynomialCommitmentScheme, EvaluationDomain, Polynomial},
+    utils::arithmetic::parallelize,
 };
 
 /// Given a vector v, computes a vector of length 2^|v| whose i-th element
@@ -50,14 +51,17 @@ pub(crate) fn lagrange_evals_at<F: PrimeField + WithSmallOrderMulGroup<3>>(
     let n_fe = F::from(n as u64);
     let fixed_term = (point.pow([n as u64]) - F::ONE) * n_fe.invert().unwrap();
 
-    // Compute all the powers of omega.
-    // TODO: parallelize? We could start from powers omega^0, omega^m, omega^2m, ...
-    // Where for a domain of size n, m = n / #threads
-    let mut omegas: Vec<F> = Vec::with_capacity(n);
-    omegas.push(F::ONE);
-    for _ in 0..(n - 1) {
-        omegas.push(*omegas.last().unwrap() * omega);
-    }
+    // Compute all the powers of omega. Each parallel chunk computes its own
+    // starting power via fast exponentiation, then fills the rest of its
+    // chunk with a local sequential cumulative product.
+    let mut omegas: Vec<F> = vec![F::ZERO; n];
+    parallelize(&mut omegas, |chunk, start| {
+        let mut chunk_omega = omega.pow_vartime([start as u64]);
+        for v in chunk.iter_mut() {
+            *v = chunk_omega;
+            chunk_omega *= omega;
+        }
+    });
 
     omegas
         .into_par_iter()
