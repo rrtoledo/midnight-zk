@@ -20,7 +20,7 @@ use crate::{
     field::AssignedNative,
     instructions::{ArithInstructions, AssignmentInstructions},
     verifier::{
-        utils::{mul_add, try_reduce},
+        utils::inner_product,
         SelfEmulation,
     },
 };
@@ -68,13 +68,20 @@ pub(crate) fn eval_expression<S: SelfEmulation>(
     }
 }
 
+/// Compresses `expressions` into `sum_i weights[i] * eval(expressions[i])`.
+///
+/// `weights` must have (at least) as many elements as `expressions`; only its
+/// first `expressions.len()` entries are used. This mirrors the host-side
+/// `evaluate_lc`/trash-compression logic in `proofs/src/plonk/evaluation.rs`,
+/// which independently weights each term instead of using powers of a single
+/// challenge (that scheme keeps the folding-variable degree low).
 pub(crate) fn compress_expressions<S: SelfEmulation>(
     layouter: &mut impl Layouter<S::F>,
     scalar_chip: &S::ScalarChip,
     advice_evals: &[AssignedNative<S::F>],
     fixed_evals: &[AssignedNative<S::F>],
     instance_evals: &[AssignedNative<S::F>],
-    r: &AssignedNative<S::F>,
+    weights: &[AssignedNative<S::F>],
     expressions: &[Expression<S::F>],
 ) -> Result<AssignedNative<S::F>, Error> {
     let evaluated_expressions = expressions
@@ -91,8 +98,5 @@ pub(crate) fn compress_expressions<S: SelfEmulation>(
         })
         .collect::<Result<Vec<_>, Error>>()?;
 
-    try_reduce(evaluated_expressions, |acc, eval| {
-        // acc := acc * r + eval
-        mul_add(layouter, scalar_chip, &acc, r, &eval)
-    })
+    inner_product(layouter, scalar_chip, &evaluated_expressions, &weights[..expressions.len()])
 }

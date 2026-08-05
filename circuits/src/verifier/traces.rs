@@ -10,7 +10,7 @@ pub struct VerifierTrace<S: SelfEmulation> {
     pub(crate) permutations: super::permutation::Committed<S>,
     pub(crate) beta: AssignedNative<S::F>,
     pub(crate) gamma: AssignedNative<S::F>,
-    pub(crate) theta: AssignedNative<S::F>,
+    pub(crate) theta: Vec<AssignedNative<S::F>>,
     pub(crate) trash_challenge: AssignedNative<S::F>,
-    pub(crate) y: AssignedNative<S::F>,
+    pub(crate) y: Vec<AssignedNative<S::F>>,
 }

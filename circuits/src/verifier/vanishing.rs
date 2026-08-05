@@ -24,7 +24,7 @@ use crate::{
         kzg::VerifierQuery,
         msm::AssignedMsm,
         transcript_gadget::TranscriptGadget,
-        utils::{mul_add, mul_bounded_scalars, try_reduce, AssignedBoundedScalar},
+        utils::{inner_product, mul_bounded_scalars, AssignedBoundedScalar},
         SelfEmulation,
     },
 };
@@ -106,14 +106,14 @@ impl<S: SelfEmulation> PartiallyEvaluated<S> {
         layouter: &mut impl Layouter<S::F>,
         scalar_chip: &S::ScalarChip,
         expressions: &[AssignedNative<S::F>],
-        y: &AssignedNative<S::F>,
+        y: &[AssignedNative<S::F>],
         xn: &AssignedNative<S::F>,
     ) -> Result<Evaluated<S>, Error> {
         let expected_h_eval = {
-            let num = try_reduce(expressions.iter().cloned(), |h_eval, v| {
-                // h_eval * y + v
-                mul_add(layouter, scalar_chip, &h_eval, y, &v)
-            })?;
+            // `y` weights each identity independently (`sum_i y[i] * expressions[i]`)
+            // rather than combining them via powers of a single challenge, matching
+            // `proofs/src/plonk/evaluation.rs`'s folding-degree-preserving scheme.
+            let num = inner_product(layouter, scalar_chip, expressions, y)?;
             let den = scalar_chip.add_constant(layouter, xn, -S::F::ONE)?;
             scalar_chip.div(layouter, &num, &den)?
         };

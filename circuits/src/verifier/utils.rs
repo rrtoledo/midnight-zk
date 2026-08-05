@@ -316,21 +316,6 @@ pub(crate) fn truncated_powers<F: PrimeField>(
         .collect()
 }
 
-/// The "try" analog of `reduce` (just like `try_fold` and `fold`). This has
-/// hard-coded the plonk::Error type.
-///
-/// # Error
-///
-/// Returns a `Synthesis` error if the iterator is empty.
-pub(crate) fn try_reduce<T, F>(iter: impl IntoIterator<Item = T>, f: F) -> Result<T, Error>
-where
-    F: FnMut(T, T) -> Result<T, Error>,
-{
-    let mut iterator = iter.into_iter();
-    let first = iterator.next().ok_or(Error::Synthesis)?;
-    iterator.try_fold(first, f)
-}
-
 /// Computes `x * y + z`.
 pub(crate) fn mul_add<F: PrimeField>(
     layouter: &mut impl Layouter<F>,

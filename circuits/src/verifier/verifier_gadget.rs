@@ -260,8 +260,22 @@ impl<S: SelfEmulation> VerifierGadget<S> {
             .map(|_| transcript.read_point(layouter))
             .collect::<Result<Vec<_>, Error>>()?;
 
-        // Sample theta challenge for keeping lookup columns linearly independent
-        let theta = transcript.squeeze_challenge(layouter)?;
+        // Sample theta challenges for keeping lookup columns linearly independent.
+        // We need one theta per input/table expression (rather than using powers
+        // of a single challenge), to avoid increasing the folding-variable degree;
+        // see `proofs/src/plonk/verifier.rs`'s `nb_theta` computation.
+        let nb_theta = cs
+            .lookups()
+            .iter()
+            .map(|l| {
+                assert_eq!(l.input_expressions().len(), l.table_expressions().len());
+                l.input_expressions().len()
+            })
+            .max()
+            .unwrap_or(1);
+        let theta = (0..nb_theta)
+            .map(|_| transcript.squeeze_challenge(layouter))
+            .collect::<Result<Vec<_>, Error>>()?;
 
         let lookups_permuted = cs
             .lookups()
@@ -293,8 +307,20 @@ impl<S: SelfEmulation> VerifierGadget<S> {
 
         let vanishing = vanishing::read_commitments_before_y(layouter, &mut transcript)?;
 
-        // Sample y challenge, which keeps the gates linearly independent
-        let y = transcript.squeeze_challenge(layouter)?;
+        // Sample y challenges, which keep the gates/permutation/lookup/trash
+        // identities linearly independent. As with `theta`, we need one
+        // independent challenge per identity (rather than powers of a single
+        // challenge) to avoid increasing the folding-variable degree; see
+        // `proofs/src/plonk/verifier.rs`'s `nb_y` computation.
+        let nb_y = {
+            let chunk_len = cs.degree() - 2;
+            let num_sets = cs.permutation().get_columns().len().div_ceil(chunk_len);
+            let gates_sum: usize = cs.gates().iter().map(|g| g.polynomials().len()).sum();
+            gates_sum + 2 + (num_sets - 1) + num_sets + 5 * cs.lookups().len() + cs.trashcans().len()
+        };
+        let y = (0..nb_y)
+            .map(|_| transcript.squeeze_challenge(layouter))
+            .collect::<Result<Vec<_>, Error>>()?;
 
         Ok((
             super::traces::VerifierTrace {

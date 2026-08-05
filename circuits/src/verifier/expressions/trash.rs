@@ -44,13 +44,17 @@ pub(crate) fn trash_expressions<S: SelfEmulation>(
     trash_challenge: &AssignedNative<S::F>,
 ) -> Result<Vec<AssignedNative<S::F>>, Error> {
     let id = {
+        // The host (proofs/src/plonk/evaluation.rs) weights every trash
+        // constraint expression by the same single `trash_challenge` (summed,
+        // not raised to powers) rather than vectorising it like `theta`/`y`.
+        let weights = vec![trash_challenge.clone(); constraint_expressions.len()];
         let compressed = compress_expressions::<S>(
             layouter,
             scalar_chip,
             advice_evals,
             fixed_evals,
             instance_evals,
-            trash_challenge,
+            &weights,
             constraint_expressions,
         )?;
 
