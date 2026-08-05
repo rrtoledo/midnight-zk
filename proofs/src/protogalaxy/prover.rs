@@ -17,8 +17,8 @@ use crate::{
     plonk::{compute_trace, traces::FoldingProverTrace, Circuit, Error, ProvingKey},
     poly::{
         commitment::{PolynomialCommitmentScheme, TOTAL_PCS_TIME},
-        Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial,
-        PolynomialRepresentation, TOTAL_FFT_TIME,
+        Coeff, EvaluationDomain, ExtendedLagrangeCoeff, Polynomial, PolynomialRepresentation,
+        TOTAL_FFT_TIME,
     },
     protogalaxy::{
         utils::{batch_traces, lagrange_evals_at, linear_combination, pow_vec},
@@ -243,47 +243,8 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
         Ok(self)
     }
 
-    fn compute_h(&self, folded_trace: &FoldingProverTrace<F>) -> Polynomial<F, LagrangeCoeff> {
-        let FoldingProverTrace {
-            fixed_polys,
-            advice_polys,
-            instance_values,
-            lookups,
-            permutations,
-            trashcans,
-            challenges,
-            beta,
-            gamma,
-            theta,
-            y,
-            trash_challenge,
-            ..
-        } = folded_trace;
-
-        self.folding_pk.ev.evaluate_h::<LagrangeCoeff>(
-            &self.folding_pk.domain,
-            &self.folding_pk.cs,
-            &advice_polys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-            &instance_values.iter().map(|i| i.as_slice()).collect::<Vec<_>>(),
-            fixed_polys,
-            challenges,
-            y,
-            *beta,
-            *gamma,
-            theta,
-            *trash_challenge,
-            lookups,
-            trashcans,
-            permutations,
-            &self.folding_pk.l0,
-            &self.folding_pk.l_last,
-            &self.folding_pk.l_active_row,
-            &self.folding_pk.permutation_pk_cosets,
-        )
-    }
-
     fn compute_error(&self, folded_trace: &FoldingProverTrace<F>, beta_pows: &[F; K]) -> F {
-        let witness_poly = self.compute_h(folded_trace);
+        let witness_poly = self.folding_pk.compute_h(folded_trace);
         let beta_powers = pow_vec(beta_pows);
 
         witness_poly
@@ -319,7 +280,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
             })
             .collect::<Vec<_>>();
 
-        let witness_poly = self.compute_h(&self.folded_trace);
+        let witness_poly = self.folding_pk.compute_h(&self.folded_trace);
         let res = witness_poly
             .values
             .into_iter()

@@ -295,48 +295,6 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
         CS::multi_open(params, &queries, transcript).map_err(|_| Error::ConstraintSystemFailure)
     }
 
-    fn compute_h(
-        folding_pk: &FoldingPk<F>,
-        folded_trace: &FoldingProverTrace<F>,
-    ) -> Polynomial<F, LagrangeCoeff> {
-        let FoldingProverTrace {
-            fixed_polys,
-            advice_polys,
-            instance_values,
-            lookups,
-            permutations,
-            trashcans,
-            challenges,
-            beta,
-            gamma,
-            theta,
-            trash_challenge,
-            y,
-            ..
-        } = folded_trace;
-
-        folding_pk.ev.evaluate_h::<LagrangeCoeff>(
-            &folding_pk.domain,
-            &folding_pk.cs,
-            &advice_polys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-            &instance_values.iter().map(|i| i.as_slice()).collect::<Vec<_>>(),
-            fixed_polys,
-            challenges,
-            y,
-            *beta,
-            *gamma,
-            theta,
-            *trash_challenge,
-            lookups,
-            trashcans,
-            permutations,
-            &folding_pk.l0,
-            &folding_pk.l_last,
-            &folding_pk.l_active_row,
-            &folding_pk.permutation_pk_cosets,
-        )
-    }
-
     /// Computes:
     ///
     /// ```text
@@ -389,7 +347,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
             .iter_mut()
             .zip(lifted_folding_trace.iter())
             .map(|(instance, trace)| {
-                let witness_poly = Self::compute_h(folding_pk, trace);
+                let witness_poly = folding_pk.compute_h(trace);
                 *instance = witness_poly.values;
 
                 instance

@@ -47,6 +47,48 @@ pub struct FoldingPk<F: PrimeField> {
 }
 
 impl<F: PrimeField + WithSmallOrderMulGroup<3>> FoldingPk<F> {
+    /// Evaluates the (folded) constraint system on a folded trace, producing
+    /// the `h(X)` polynomial (in Lagrange form) that the folding prover and
+    /// verifier both need to reconstruct/check.
+    pub fn compute_h(&self, folded_trace: &FoldingProverTrace<F>) -> Polynomial<F, LagrangeCoeff> {
+        let FoldingProverTrace {
+            fixed_polys,
+            advice_polys,
+            instance_values,
+            lookups,
+            permutations,
+            trashcans,
+            challenges,
+            beta,
+            gamma,
+            theta,
+            trash_challenge,
+            y,
+            ..
+        } = folded_trace;
+
+        self.ev.evaluate_h::<LagrangeCoeff>(
+            &self.domain,
+            &self.cs,
+            &advice_polys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &instance_values.iter().map(|i| i.as_slice()).collect::<Vec<_>>(),
+            fixed_polys,
+            challenges,
+            y,
+            *beta,
+            *gamma,
+            theta,
+            *trash_challenge,
+            lookups,
+            trashcans,
+            permutations,
+            &self.l0,
+            &self.l_last,
+            &self.l_active_row,
+            &self.permutation_pk_cosets,
+        )
+    }
+
     /// Given a FoldingPk, it takes the folded trace and returns a proving key.
     /// Concretely, it uses the folded fixed polys as the fixed polys for
     /// the proving key.
