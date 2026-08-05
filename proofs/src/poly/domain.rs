@@ -349,6 +349,8 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
         );
 
         a.values.truncate(self.n as usize);
+        a.values.shrink_to_fit();
+
         self.distribute_powers_zeta(&mut a.values, false);
 
         best_fft(&mut a.values, self.omega, self.k);
