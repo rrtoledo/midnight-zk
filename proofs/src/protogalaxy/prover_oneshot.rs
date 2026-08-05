@@ -26,7 +26,12 @@ use crate::{
     utils::arithmetic::eval_polynomial,
 };
 
-struct ProtogalaxyProverOneShot<
+/// This prover can perform a 2**K - 1 to one folding, producing a single,
+/// self-contained proof (unlike [super::prover::ProtogalaxyProver], which
+/// returns an intermediate object that must be handed directly to the
+/// verifier alongside the proof bytes).
+#[derive(Debug)]
+pub struct ProtogalaxyProverOneShot<
     F: WithSmallOrderMulGroup<3>,
     CS: PolynomialCommitmentScheme<F>,
     const K: usize,
@@ -119,7 +124,8 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
             _marker: PhantomData,
         };
 
-        transcript.write(&CS::commit(params, &poly_k_coeff))?;
+        let poly_k_commitment = CS::commit(params, &poly_k_coeff);
+        transcript.write(&poly_k_commitment)?;
 
         let gamma = transcript.squeeze_challenge();
 

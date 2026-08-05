@@ -83,6 +83,11 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
 
         let _poly_k: CS::Commitment = transcript.read()?;
         let gamma: F = transcript.squeeze_challenge();
+        // `gamma` gets shadowed below by `VerifierFoldingTrace`'s own `gamma`
+        // field (a per-proof vanishing-argument challenge, unrelated to this
+        // protogalaxy folding challenge). Keep an unshadowed handle to this
+        // one, since it's what `fold_traces` used to combine the K traces.
+        let pg_gamma = gamma;
         let k_at_gamma: F = transcript.read()?;
         let z_in_gamma: F = gamma.pow_vartime([dk_domain.n]) - F::ONE;
 
