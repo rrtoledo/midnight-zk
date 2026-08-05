@@ -84,7 +84,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
         )?
         .into_folding_trace(pk.fixed_values.clone());
 
-        let folding_pk = FoldingPk::from(pk);
+        let folding_pk = FoldingPk::from(&pk);
         let beta_powers = [F::ONE; K];
         let error_term = F::ZERO;
 

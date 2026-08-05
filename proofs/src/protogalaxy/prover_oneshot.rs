@@ -108,7 +108,7 @@ impl<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>, const K: u
             pk.vk.cs().folding_degree() as u32,
             traces.len().trailing_zeros(),
         );
-        let folding_pk = FoldingPk::from(pk.clone());
+        let folding_pk = FoldingPk::from(&pk);
 
         // Compute evaluations of lagrange polynomials on beta_pg
         let lagrange_on_beta: Vec<F> = lagrange_evals_at(pk.vk.get_domain(), &beta_pg);

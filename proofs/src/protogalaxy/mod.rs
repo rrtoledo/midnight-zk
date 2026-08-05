@@ -1,6 +1,7 @@
 //! TODO
 
 use ff::{PrimeField, WithSmallOrderMulGroup};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     plonk::{
@@ -152,9 +153,9 @@ impl<F: PrimeField + WithSmallOrderMulGroup<3>> FoldingPk<F> {
 }
 
 impl<F: PrimeField + WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F>>
-    From<ProvingKey<F, CS>> for FoldingPk<F>
+    From<&ProvingKey<F, CS>> for FoldingPk<F>
 {
-    fn from(pk: ProvingKey<F, CS>) -> Self {
+    fn from(pk: &ProvingKey<F, CS>) -> Self {
         let domain = pk.vk.get_domain().clone();
         let cs = pk.vk.cs();
 
@@ -182,6 +183,19 @@ impl<F: PrimeField + WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F
             }
         });
 
+        const COSET_CONVERSION_MEMORY_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+        let per_buffer_bytes = domain.extended_len() * std::mem::size_of::<F>();
+        let chunk_size = (COSET_CONVERSION_MEMORY_BUDGET_BYTES / per_buffer_bytes.max(1))
+            .clamp(1, pk.permutation.cosets.len().max(1));
+        let permutation_pk_cosets: Vec<_> = pk
+            .permutation
+            .cosets
+            .chunks(chunk_size)
+            .flat_map(|chunk| {
+                chunk.par_iter().map(|poly| domain.extended_to_lagrange(poly.clone())).collect::<Vec<_>>()
+            })
+            .collect();
+
         Self {
             cs: cs.clone(),
             l0,
@@ -189,10 +203,8 @@ impl<F: PrimeField + WithSmallOrderMulGroup<3>, CS: PolynomialCommitmentScheme<F
             l_active_row,
             permutation_pk_permutations: pk.permutation.permutations.clone(),
             permutation_pk_polys: pk.permutation.polys.clone(),
-            permutation_pk_cosets: (pk.permutation.cosets.into_iter())
-                .map(|poly| domain.extended_to_lagrange(poly))
-                .collect(),
-            ev: pk.ev,
+            permutation_pk_cosets,
+            ev: pk.ev.clone(),
             domain,
         }
     }
